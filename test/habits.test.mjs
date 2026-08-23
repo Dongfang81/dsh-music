@@ -85,6 +85,27 @@ test('summary aggregates top songs, artists, today, and night activity', async (
 	assert.equal(s.topArtists[0].seconds, 70);
 });
 
+test('exportLegacy returns factual song and hourly data without inferred preferences', async () => {
+	const base = new Date(2026, 7, 21, 10, 0, 0).getTime();
+	const { habits } = makeHabits(base);
+	await habits.recordPlayback({ song: song(1, '晴天', '周杰伦'), position: 0, duration: 200, playing: true });
+	await habits.recordPlayback({ song: song(1, '晴天', '周杰伦'), position: 30, duration: 200, playing: true });
+
+	const legacy = await habits.exportLegacy();
+	assert.deepEqual(legacy.songs, [{
+		id: 1,
+		name: '晴天',
+		artists: '周杰伦',
+		album: 'Album',
+		plays: 1,
+		seconds: 30,
+		completed: 0,
+		lastAt: base
+	}]);
+	assert.equal(legacy.byHour[10], 30);
+	assert.equal('dislikes' in legacy, false);
+});
+
 test('nightCheck reminds once after 2h of night listening, then only again after 24h', async () => {
 	const base = new Date(2026, 7, 20, 23, 0, 0).getTime();
 	const { habits, setTime } = makeHabits(base);
