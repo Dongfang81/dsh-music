@@ -991,6 +991,7 @@ window.__ModuleLoader__.load({
 			React.useEffect(function () { return onPetHidden(setHidden); }, []);
 			var [notice, setNotice] = React.useState(null); // {kind:'ok'|'err'|'', text}
 			var [busy, setBusy] = React.useState(false);
+			var recommendRequestRef = React.useRef(0);
 			var [lrc, setLrc] = React.useState(null); // [{t,text}] 当前歌歌词
 			var [lyricsOpen, setLyricsOpen] = React.useState(false); // 展开视图歌词面板
 			var [shareOpen, setShareOpen] = React.useState(false); // 微信分享面板
@@ -1351,13 +1352,20 @@ window.__ModuleLoader__.load({
 			// 推荐播放：不知道听什么时一键推荐
 			var onRecommend = function () {
 				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
+				var requestId = "recommend-" + Date.now() + "-" + (recommendRequestRef.current + 1);
+				recommendRequestRef.current = requestId;
 				setBusy(true);
-				post("/dsh-alger/recommend", {}).then(function (r) {
+				post("/dsh-alger/recommend", { requestId: requestId }).then(function (r) {
+					if (recommendRequestRef.current !== requestId) return;
 					setBusy(false);
 					if (r && !r.ok) flash("err", (r && r.guidance) || (r && r.error) || "推荐失败");
 					// 成功时结果由宠物气泡播报（服务端 notice）
 					setTimeout(refresh, 600);
-				}).catch(function () { setBusy(false); flash("err", "推荐失败"); });
+				}).catch(function () {
+					if (recommendRequestRef.current !== requestId) return;
+					setBusy(false);
+					flash("err", "推荐失败");
+				});
 			};
 
 			// 播放收藏列表：整单替换队列播放，并展开播放列表展示

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,10 +34,24 @@ test('npm package contains every local asset linked from the published README', 
 			env: { ...process.env, npm_config_cache: cache }
 		});
 		const packedFiles = new Set(JSON.parse(output)[0].files.map((file) => file.path));
-		for (const requiredPath of ['README.md', 'docs/IP.md', 'docs/moony-series.png']) {
+		for (const requiredPath of [
+			'README.md', 'docs/IP.md', 'docs/moony-series.png',
+			'lib/recommendation/identity.js', 'lib/recommendation/profile.js',
+			'lib/recommendation/coordinator.js', 'lib/recommendation/local-library.js'
+		]) {
 			assert.ok(packedFiles.has(requiredPath), `${requiredPath} must be included in the npm tarball`);
 		}
 	} finally {
 		rmSync(cache, { recursive: true, force: true });
+	}
+});
+
+test('recommendation docs explain both mechanisms and local privacy controls', () => {
+	const readme = readFileSync(join(root, 'README.md'), 'utf8');
+	for (const phrase of ['快速推荐', '对话情绪价值', 'localMusicPaths', 'recommendationLearning', '~/.dsh/', '不读取 DSH 对话']) {
+		assert.ok(readme.includes(phrase), `README must document: ${phrase}`);
+	}
+	for (const file of ['identity.js', 'profile.js', 'coordinator.js', 'local-library.js']) {
+		assert.ok(existsSync(join(root, 'lib/recommendation', file)), `${file} must ship`);
 	}
 });
