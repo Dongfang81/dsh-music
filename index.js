@@ -27,7 +27,7 @@
  */
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createClient } from './lib/alger.js';
 import { createPlayer } from './lib/player.js';
 import { createHabits } from './lib/habits.js';
@@ -42,6 +42,11 @@ import { createRecommendationCoordinator } from './lib/recommendation/coordinato
 
 export const name = '@dongfang81/dsh-music';
 export const inject = ['subprocess', 'tools', 'webServer'];
+
+export function resolveDataRoot(env = process.env, home = homedir()) {
+	const configured = String(env?.DSH_HOME ?? '').trim();
+	return configured ? resolve(configured) : join(home, '.dsh');
+}
 
 /** 默认配置（可被 cordis.patch.yml 的 config 覆盖）。 */
 const DEFAULTS = {
@@ -1364,17 +1369,19 @@ export function apply(ctx, config) {
 	// 用箭头包装保持 this 指向 subprocess 服务实例。
 	const spawn = (spec) => ctx.subprocess.spawn(spec);
 
+	// 所有本地数据服从 DSH_HOME，确保不同 profile/隔离验收不会互相污染。
+	const dataRoot = resolveDataRoot();
 	// 内置播放状态机 + 音乐 API 客户端（不再依赖任何桌面播放器）
-	const player = createPlayer();
+	const player = createPlayer({ file: join(dataRoot, 'moony-singer-state.json') });
 	const client = createClient(cfg);
 	// 听歌记忆（纯本地播放习惯记录）
-	const habits = createHabits();
+	const habits = createHabits({ file: join(dataRoot, 'moony-singer-habits.json') });
 	let tasteProfile = null;
 	let localLibrary = null;
 	let sourceResolver = null;
 	let coordinator = null;
 	try {
-		tasteProfile = createTasteProfile({ file: join(homedir(), '.dsh', 'moony-singer-recommendation.json') });
+		tasteProfile = createTasteProfile({ file: join(dataRoot, 'moony-singer-recommendation.json') });
 		if (cfg.recommendationLearning) {
 			habits.exportLegacy().then((legacy) => tasteProfile.migrateLegacy(legacy)).catch(() => {});
 		}

@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildToolsForTest, createPreferenceAction, registerRoutesForTest } from '../../index.js';
+import { buildToolsForTest, createPreferenceAction, registerRoutesForTest, resolveDataRoot } from '../../index.js';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 
@@ -72,4 +72,9 @@ test('client recommendation button sends request ids and ignores stale responses
 	assert.match(source, /recommendRequestRef/);
 	assert.match(source, /requestId:\s*requestId/);
 	assert.match(source, /recommendRequestRef\.current\s*!==\s*requestId/);
+});
+
+test('profile data follows DSH_HOME instead of leaking across isolated profiles', () => {
+	assert.equal(resolveDataRoot({ DSH_HOME: '/private/tmp/isolated-dsh' }, '/Users/example'), '/private/tmp/isolated-dsh');
+	assert.equal(resolveDataRoot({}, '/Users/example'), '/Users/example/.dsh');
 });
