@@ -15,9 +15,11 @@ function fakePlayer() {
 	return {
 		cleared: false,
 		afterCurrent: [],
+		state: { queue: [current] },
 		current: () => current,
 		insertRecommendationAfterCurrent(tracks, sessionId) {
 			this.afterCurrent = tracks.map((track) => ({ ...track, recommendationSessionId: sessionId }));
+			this.state.queue = [current, ...this.afterCurrent];
 			return this.afterCurrent.length;
 		}
 	};
@@ -39,11 +41,15 @@ function coordinator(overrides = {}) {
 			collectCandidates: async () => ({ tracks: candidates, failures: [] }),
 			resolver: { resolve: async (track) => ({ playable: true, kind: 'direct', url: `https://${track.trackKey}`, confidence: 0.95 }) },
 			rankCandidates: ({ candidates: tracks }) => tracks.map((track, index) => ({ track, total: 100 - index })),
-			planQueue: ({ ranked, targetSize, currentTrack }) => ({
+			planQueue: ({ ranked, targetSize, currentTrack, existingQueue }) => {
+				const blocked = new Set((existingQueue || []).map((track) => track.trackKey));
+				const available = ranked.filter((entry) => !blocked.has(entry.track.trackKey));
+				return {
 				insertAfterTrackKey: currentTrack.trackKey,
-				tracks: ranked.slice(0, targetSize).map((entry) => entry.track),
-				shortfall: Math.max(0, targetSize - ranked.length)
-			}),
+				tracks: available.slice(0, targetSize).map((entry) => entry.track),
+				shortfall: Math.max(0, targetSize - available.length)
+				};
+			},
 			targetSize: 8,
 			preflightCount: 5,
 			timeoutMs: 1000,
@@ -78,6 +84,15 @@ test('a second request cancels the first without clearing the queue', async () =
 	assert.equal((await first).cancelled, true);
 	assert.equal((await second).ok, true);
 	assert.equal(player.cleared, false);
+});
+
+test('background expansion preserves the five preflight tracks', async () => {
+	const { value, player } = coordinator();
+	const first = await value.recommend();
+	await new Promise((resolve) => setTimeout(resolve, 15));
+	assert.equal(first.tracks.length, 5);
+	assert.equal(player.afterCurrent.length, 8);
+	assert.deepEqual(player.afterCurrent.slice(0, 5).map((track) => track.trackKey), first.tracks.map((track) => track.trackKey));
 });
 
 test('plugin-local failures return honest structure instead of throwing', async () => {

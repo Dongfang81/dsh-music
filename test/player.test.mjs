@@ -38,3 +38,10 @@ test('canonical recommendation tracks are converted back to player song shape', 
 	assert.equal(queued.resolvedUrl, 'https://audio.example/song');
 	assert.equal(queued.trackKey, canonical.trackKey);
 });
+
+test('recommendation starts its first verified track when nothing is active', () => {
+	const player = createPlayer({ file: null });
+	player.insertRecommendationAfterCurrent([song(7, '第一首推荐'), song(8, '第二首推荐')], 'session-empty');
+	assert.equal(player.current().name, '第一首推荐');
+	assert.equal(player.state.playing, true);
+});
