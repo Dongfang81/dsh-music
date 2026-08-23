@@ -10,3 +10,9 @@
         musicApiHost: '127.0.0.1'
         # 单次 HTTP/命令操作超时（毫秒）
         timeoutMs: 20000
+        # 可选：仅扫描这里明确列出的本地音乐绝对路径；默认不读取任何目录
+        localMusicPaths: []
+        # 是否根据本地播放反馈更新推荐偏好
+        recommendationLearning: true
+        # 点击“推荐”时计划插入的歌曲数
+        recommendationTargetSize: 15
