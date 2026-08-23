@@ -8,7 +8,9 @@ const emptyProfile = { version: 2, tracks: {}, artists: {}, rules: [], resolverS
 
 test('night is an energy hint, not an automatic sleep request', () => {
 	const cx = buildButtonContext({
-		now: new Date('2026-08-23T23:30:00+08:00'),
+		// Recommendation context follows the DSH host's local clock. Construct a
+		// host-local time so this assertion is stable in UTC CI and on user Macs.
+		now: new Date(2026, 7, 23, 23, 30),
 		profile: emptyProfile
 	});
 	assert.equal(cx.weights.taste, 0.5);
