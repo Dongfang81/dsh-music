@@ -300,7 +300,7 @@ git commit -m "feat: add recommendation context and candidate retrieval"
 - Create: `lib/recommendation/local-library.js`
 - Create: `test/recommendation/local-library.test.mjs`
 - Modify: `package.json`
-- Modify: `pnpm-lock.yaml`
+- Modify: `package-lock.json`
 - Modify: `cordis.patch.yml`
 
 **Interfaces:**
@@ -332,9 +332,9 @@ Expected: FAIL because module does not exist.
 
 - [ ] **Step 3: Add and install `music-metadata`**
 
-Run: `pnpm add music-metadata`
+Run: `npm install music-metadata --save`
 
-Expected: `package.json` and `pnpm-lock.yaml` contain the resolved dependency.
+Expected: `package.json` and `package-lock.json` contain the resolved dependency.
 
 - [ ] **Step 4: Implement safe indexing**
 
@@ -350,14 +350,14 @@ recommendationTargetSize: 15
 
 - [ ] **Step 5: Run focused tests and dependency audit**
 
-Run: `node --test test/recommendation/local-library.test.mjs && pnpm audit --prod`
+Run: `node --test test/recommendation/local-library.test.mjs && npm audit --omit=dev`
 
 Expected: tests PASS; audit reports no unreviewed high/critical production issue. If the audit finds one, stop and choose a safe fixed version before continuing.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add lib/recommendation/local-library.js test/recommendation/local-library.test.mjs package.json pnpm-lock.yaml cordis.patch.yml
+git add lib/recommendation/local-library.js test/recommendation/local-library.test.mjs package.json package-lock.json cordis.patch.yml
 git commit -m "feat: add allowlisted local music library"
 ```
 
