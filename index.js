@@ -32,7 +32,13 @@ import { createClient } from './lib/alger.js';
 import { createPlayer } from './lib/player.js';
 import { createHabits } from './lib/habits.js';
 import { startApiServer, stopApiServer } from './lib/api-server.js';
-import { matchSourceUrl, matchSourceByKeyword } from './lib/source-match.js';
+import { matchSourceUrl, matchSourceByKeyword, safeCrossSourceDuration } from './lib/source-match.js';
+import { normalizeTrack } from './lib/recommendation/identity.js';
+import { createTasteProfile } from './lib/recommendation/profile.js';
+import { createLocalLibrary } from './lib/recommendation/local-library.js';
+import { createRetrievers } from './lib/recommendation/retrievers.js';
+import { createSourceResolver } from './lib/recommendation/source-resolver.js';
+import { createRecommendationCoordinator } from './lib/recommendation/coordinator.js';
 
 export const name = '@dongfang81/dsh-music';
 export const inject = ['subprocess', 'tools', 'webServer'];
@@ -42,7 +48,10 @@ const DEFAULTS = {
 	// 内置音乐 API 服务（插件自启，无需任何桌面播放器）
 	musicApiPort: 30588,
 	musicApiHost: '127.0.0.1',
-	timeoutMs: 20000
+	timeoutMs: 20000,
+	localMusicPaths: [],
+	recommendationLearning: true,
+	recommendationTargetSize: 15
 };
 
 function resolveConfig(config) {
@@ -74,6 +83,31 @@ function compileParameters(spec) {
 
 function asRecord(value) {
 	return typeof value === 'object' && value !== null ? value : {};
+}
+
+export function createPreferenceAction(profile) {
+	return async function preference(args) {
+		const action = String(args?.action ?? 'summary');
+		if (action === 'summary') return { ok: true, profile: await profile.snapshot() };
+		if (action === 'remember') {
+			const kind = String(args?.kind ?? '').trim();
+			const value = String(args?.value ?? '').trim();
+			if (!kind) throw new Error('remember requires kind');
+			if (!value) throw new Error('remember requires value');
+			const rule = await profile.remember({ kind, value, weight: args?.weight });
+			return { ok: true, rule };
+		}
+		if (action === 'forget') {
+			const ruleId = String(args?.ruleId ?? '').trim();
+			if (!ruleId) throw new Error('forget requires ruleId');
+			return { ok: true, forgotten: await profile.forget(ruleId) };
+		}
+		if (action === 'clear') {
+			await profile.clear();
+			return { ok: true, cleared: true };
+		}
+		throw new Error('action must be summary / remember / forget / clear');
+	};
 }
 
 /** 网易云歌曲 → 紧凑结构（与 App 自己展示的字段一致）。 */
@@ -114,7 +148,14 @@ function normalize(s) {
  * @param {object} apiHandle - 内置 API 服务状态（{handle, isUp, serverEntryPath}）
  * @param {object} habits - 听歌记忆模块（lib/habits.js）
  */
-function buildActions(cfg, client, shared, player, apiHandle, habits) {
+function buildActions(cfg, client, shared, player, apiHandle, habits, recommendation = {}) {
+	const coordinator = recommendation.coordinator ?? null;
+	const preference = recommendation.preference ?? null;
+	const feedback = (type, song) => {
+		if (!cfg.recommendationLearning || !coordinator || !song) return;
+		const track = song.trackKey ? song : normalizeTrack(song, 'player');
+		if (track) coordinator.feedback({ type, track }).catch(() => {});
+	};
 	// 宠物台词/通知（agent → 宠物气泡，约 6 秒）
 	const noticeStore = { text: '', until: 0 };
 	shared.setNotice = (text, ms = 6000) => {
@@ -155,6 +196,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits) {
 	 *  返回 { url, displayName? }；displayName 为关键词匹配到的原版标题（与列表歌名不同时提供）；
 	 *  无法播放返回 null。 */
 	async function urlFor(song, keyword) {
+		if (song?.resolvedUrl) return { url: song.resolvedUrl };
 		const kw = String(keyword || '').trim();
 		const parts = splitKeyword(kw);
 		// 关键词歌手与歌曲歌手是否一致（如「周杰伦 晴天」vs 列表里的 A-LNK 版 → 不一致）
@@ -186,8 +228,12 @@ function buildActions(cfg, client, shared, player, apiHandle, habits) {
 		// 3) 原始关键词 → 多平台匹配（覆盖网易云下架/翻唱场景，按「歌名 - 歌手」拿原版）
 		if (kw) {
 			try {
-				// 带上目标时长（若歌曲歌手与关键词一致），让平台匹配能校验版本，避免命中现场串烧/翻唱
-				const duration = consistent && song && song.dt ? Number(song.dt) : 0;
+				// 只有标题和歌手 token 都精确匹配时才借用候选时长；翻唱/部分命中必须传 0。
+				const duration = safeCrossSourceDuration({
+					title: song?.name,
+					artists: song?.ar ?? song?.artists,
+					durationMs: song?.dt
+				}, { title: parts.name, artists: parts.artist ? [parts.artist] : [] });
 				const hit = await matchSourceByKeyword(parts.name || kw, parts.artist, null, duration);
 				if (hit && hit.url) {
 					// 关键词匹配到的是原版：显示名用「匹配标题 + 关键词歌手」，替换列表里的翻唱信息
@@ -248,110 +294,13 @@ function buildActions(cfg, client, shared, player, apiHandle, habits) {
 			return { ok: true, text };
 		},
 
-		/** alger_recommend：推荐播放（不知道听什么时用；失败暗中重试，最多 3 次） */
-		async recommend() {
-			const steps = [];
-			const log = (s) => steps.push(String(s));
-			if (!(await apiUp())) {
-				return { ok: false, steps: [...steps, '音乐服务不可用'], guidance: '请先调用 alger_setup action=start 启动音乐服务。' };
-			}
-			const MAX_ATTEMPTS = 3;
-			const failedIds = new Set(); // 踩过坑的歌单不再重复选
-			let lastErr = '';
-			// 听歌记忆：深夜（23–5 点）且近 7 天深夜活跃 → 优先舒缓歌单
-			const hour = new Date().getHours();
-			let nightSoothing = false;
-			if (hour >= 23 || hour < 5) {
-				try {
-					nightSoothing = (await habits.summary()).nightActive;
-				} catch {
-					/* 记忆不可用时保持默认推荐 */
-				}
-				if (nightSoothing) log('深夜模式：优先「轻音乐/助眠」歌单');
-			}
-			for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-				if (attempt > 1) log(`第 ${attempt} 次尝试…`);
-				try {
-					// 1) 拉推荐歌单列表，随机挑一个合适的歌单（过滤曲目过少的）
-					let playlists = [];
-					if (nightSoothing) {
-						for (const kw of ['轻音乐', '助眠', '纯音乐']) {
-							try {
-								const res = await client.search(kw, 1000, 30);
-								playlists = (res.playlists || [])
-									.filter((p) => p && p.id && p.name && Number(p.trackCount) >= 3 && !failedIds.has(p.id))
-									.map((p) => ({ id: p.id, name: p.name, trackCount: Number(p.trackCount) || 0 }));
-							} catch {
-								/* 下一个关键词 */
-							}
-							if (playlists.length > 0) break;
-						}
-					}
-					if (playlists.length === 0) {
-						try {
-							const data = await client.getJson(`${client.apiBase}/personalized?limit=30`);
-							playlists = (data?.result || [])
-								.filter((p) => p && p.id && p.name && Number(p.trackCount) >= 3 && !failedIds.has(p.id))
-								.map((p) => ({ id: p.id, name: p.name, trackCount: Number(p.trackCount) || 0 }));
-						} catch {
-							/* 降级到热门歌单 */
-						}
-					}
-					if (playlists.length === 0) {
-						try {
-							const data = await client.getJson(`${client.apiBase}/top/playlist?limit=30`);
-							playlists = (data?.playlists || [])
-								.filter((p) => p && p.id && p.name && Number(p.trackCount) >= 3 && !failedIds.has(p.id))
-								.map((p) => ({ id: p.id, name: p.name, trackCount: Number(p.trackCount) || 0 }));
-						} catch {
-							/* 忽略 */
-						}
-					}
-					if (playlists.length === 0) {
-						lastErr = '推荐接口无结果';
-						log(lastErr);
-						continue; // 换一批再试
-					}
-					const plMeta = playlists[Math.floor(Math.random() * playlists.length)];
-					log(`随机命中歌单: [${plMeta.id}] ${plMeta.name}（${plMeta.trackCount} 首）`);
-
-					// 2) 取歌单歌曲，整单替换队列播放；任一环节失败 → 记录后换歌单重试
-					const pl = await client.playlist(plMeta.id, 500);
-					const songs = (pl?.tracks || []).filter((s) => s && s.id && s.name);
-					if (songs.length === 0) {
-						lastErr = `歌单「${plMeta.name}」无可播放歌曲`;
-						failedIds.add(plMeta.id);
-						log(lastErr);
-						continue;
-					}
-					log(`歌单「${plMeta.name}」共 ${pl?.trackCount ?? songs.length} 首，取得 ${songs.length} 首，从「${songs[0].name}」开始`);
-					const song = player.replaceAndPlay(songs);
-					const firstHit = await urlFor(song);
-					if (!firstHit || !firstHit.url) {
-						lastErr = `歌单「${plMeta.name}」第一首歌无可用音源`;
-						failedIds.add(plMeta.id);
-						log(lastErr);
-						continue;
-					}
-					player.state.currentUrl = firstHit.url;
-					player.state.playing = true;
-					shared.setNotice('♫ 推荐歌单：' + plMeta.name + '（' + songs.length + ' 首）');
-					return {
-						ok: true,
-						steps,
-						playedName: song ? song.name : '',
-						playlistId: plMeta.id,
-						playlistName: plMeta.name,
-						added: songs.length,
-						queueLength: player.state.queue.length
-					};
-				} catch (err) {
-					lastErr = (err && err.message) ? String(err.message) : String(err);
-					log(lastErr);
-					/* 下一轮重试 */
-				}
-			}
-			return { ok: false, steps: [...steps, lastErr || '推荐失败'], guidance: '请稍后再试，或直接搜索点歌。' };
+		/** 按钮/明确工具请求的快速推荐：本地协调器直接执行，不经过 LLM。 */
+		async recommend(args) {
+			if (!(await apiUp())) return { ok: false, guidance: '音乐服务尚未就绪，当前播放和队列保持不变。' };
+			if (!coordinator) return { ok: false, guidance: '推荐模块未能初始化，当前播放和队列保持不变。' };
+			const result = await coordinator.recommend(asRecord(args));
+			if (result.ok) shared.setNotice(`♫ 已为你接上 ${result.tracks.length} 首，当前这首继续播`);
+			return result;
 		},
 
 		/** alger_setup：内置音乐服务管理 */
@@ -597,6 +546,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits) {
 			}
 			player.playSong(song);
 			player.state.currentUrl = url;
+			feedback('search-play', song);
 			shared.setNotice('♪ 已播放：' + song.name);
 			return { ok: true, steps, playedName: song.name, playedId: song.id, confirmed: true };
 		},
@@ -717,6 +667,11 @@ function buildActions(cfg, client, shared, player, apiHandle, habits) {
 				return { action, message: wantPlay ? '已播放' : '已暂停', playing: player.state.playing };
 			}
 			if (action === 'next' || action === 'prev') {
+				const leaving = player.current();
+				if (action === 'next' && leaving) {
+					if (player.state.position > 0 && player.state.position < 20) feedback('skip-short', leaving);
+					else if (player.state.duration > 0 && player.state.position / player.state.duration >= 0.8) feedback('complete-80', leaving);
+				}
 				const song = action === 'next' ? player.next() : player.prev();
 				if (!song) throw new Error('队列为空，无法切换。');
 				const hit = await urlFor(song);
@@ -731,6 +686,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits) {
 			}
 			if (action === 'toggle-favorite') {
 				const r = player.toggleFavorite();
+				if (r.favorite) feedback('favorite', player.current());
 				return { action, message: r.favorite ? '已收藏' : '已取消收藏', favorite: r.favorite };
 			}
 			if (action === 'playmode') {
@@ -738,6 +694,12 @@ function buildActions(cfg, client, shared, player, apiHandle, habits) {
 				return { action, message: '已切换播放模式', playMode: m };
 			}
 			throw new Error('不支持的 action: ' + action);
+		},
+
+		/** 仅供明确的长期偏好指令使用；普通对话不会自动写入。 */
+		async preference(args) {
+			if (!preference) throw new Error('偏好档案未初始化');
+			return preference(asRecord(args));
 		},
 
 		/** alger_habits：听歌记忆（查看/清空本地播放习惯，纯本地不上传） */
@@ -1076,20 +1038,45 @@ function buildTools(cfg, actions) {
 	const recommend = {
 		name: 'alger_recommend',
 		description:
-			'推荐播放：不知道听什么时，从音乐 API 的推荐歌单中随机挑一个整单播放（替换当前队列并立即开播，能连续播很久）。',
+			'仅在用户明确要求立即推荐、直接播放或“来一批歌”时调用。按钮式快速推荐会保留当前歌曲并把结果接在后面；如果用户只是在表达情绪、犹豫或闲聊，应先自然回应、提供情绪价值和想法，不要为了结构化而自动搜索或急着给结果。',
 		parameters: compileParameters({}),
 		output: {
 			schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
 			render: (_args, value) => {
 				const rec = asRecord(value);
-				const lines = (rec.steps || []).map((s) => '· ' + s);
-				if (rec.ok) lines.push('♫ 推荐歌单：' + (rec.playlistName || '') + '（' + (rec.queueLength ?? '') + ' 首）');
+				const lines = [];
+				if (rec.ok) lines.push('♫ 已接上 ' + ((rec.tracks || []).length || 0) + ' 首推荐，当前歌曲保持不变。');
 				if (rec.guidance) lines.push('提示: ' + rec.guidance);
 				return textBlock(lines);
 			}
 		},
-		execute: () => actions.recommend(),
+		execute: (rawArgs) => actions.recommend(asRecord(rawArgs)),
 		timeoutMs: Math.max(cfg.timeoutMs, 45000)
+	};
+
+	const preference = {
+		name: 'alger_preference',
+		description:
+			'管理月宝儿的长期音乐偏好。只有用户明确说“以后”“记住”“不要再推荐”之类长期指令时，才使用 remember/forget；普通情绪表达和一次性点歌不要写入。summary 只读，clear 清空本地偏好。',
+		parameters: compileParameters({
+			action: { type: 'string', enum: ['summary', 'remember', 'forget', 'clear'], required: true, description: '偏好操作。' },
+			kind: { type: 'string', enum: ['artist', 'track', 'language', 'style', 'energy'], description: 'remember 时必填。' },
+			value: { type: 'string', description: 'remember 时必填的明确偏好值。' },
+			weight: { type: 'number', description: '偏好强度 -1 到 1；-1 表示明确不要推荐。' },
+			ruleId: { type: 'string', description: 'forget 时必填。' }
+		}),
+		output: {
+			schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+			render: (_args, value) => {
+				const rec = asRecord(value);
+				if (rec.rule) return textBlock(`已记住：${rec.rule.kind} = ${rec.rule.value}`);
+				if (rec.forgotten) return textBlock('已忘记这条偏好。');
+				if (rec.cleared) return textBlock('已清空本地推荐偏好。');
+				return textBlock('已读取本地推荐偏好。');
+			}
+		},
+		execute: (rawArgs) => actions.preference(asRecord(rawArgs)),
+		timeoutMs: cfg.timeoutMs
 	};
 
 	const habitsTool = {
@@ -1153,8 +1140,10 @@ function buildTools(cfg, actions) {
 		timeoutMs: Math.max(cfg.timeoutMs, 30000)
 	};
 
-	return [status, setup, search, song, playlist, play, queue, control, say, recommend, habitsTool, similar];
+	return [status, setup, search, song, playlist, play, queue, control, say, recommend, preference, habitsTool, similar];
 }
+
+export const buildToolsForTest = buildTools;
 
 /** 读取 POST body（JSON 文本）。 */
 function readBody(req) {
@@ -1245,9 +1234,10 @@ function registerRoutes(webServer, actions) {
 		{
 			kind: 'exact',
 			path: '/dsh-alger/recommend',
-			handler: async (_req, res) => {
+			handler: async (req, res) => {
 				try {
-					json(res, await actions.recommend());
+					const body = JSON.parse((await readBody(req)) || '{}');
+					json(res, await actions.recommend(body));
 				} catch (error) {
 					json(res, { ok: false, error: String((error && error.message) || error) });
 				}
@@ -1353,6 +1343,8 @@ function registerRoutes(webServer, actions) {
 	for (const route of routes) webServer.register(route);
 }
 
+export const registerRoutesForTest = registerRoutes;
+
 
 /**
  * 插件入口：解析配置、构造客户端、注册 7 个工具与浮动窗口的 Web 路由。
@@ -1377,6 +1369,75 @@ export function apply(ctx, config) {
 	const client = createClient(cfg);
 	// 听歌记忆（纯本地播放习惯记录）
 	const habits = createHabits();
+	let tasteProfile = null;
+	let localLibrary = null;
+	let sourceResolver = null;
+	let coordinator = null;
+	try {
+		tasteProfile = createTasteProfile({ file: join(homedir(), '.dsh', 'moony-singer-recommendation.json') });
+		if (cfg.recommendationLearning) {
+			habits.exportLegacy().then((legacy) => tasteProfile.migrateLegacy(legacy)).catch(() => {});
+		}
+	} catch (error) {
+		console.warn('[dsh-moony-singer] 推荐偏好档案初始化失败: ' + ((error && error.message) || String(error)));
+	}
+	try {
+		localLibrary = createLocalLibrary({ roots: Array.isArray(cfg.localMusicPaths) ? cfg.localMusicPaths : [] });
+		localLibrary.scan().catch((error) => {
+			console.warn('[dsh-moony-singer] 本地音乐扫描失败: ' + ((error && error.message) || String(error)));
+		});
+	} catch (error) {
+		console.warn('[dsh-moony-singer] 本地音乐库初始化失败: ' + ((error && error.message) || String(error)));
+	}
+	try {
+		sourceResolver = createSourceResolver({
+			local: localLibrary ? async (track) => {
+				const local = await localLibrary.resolve(track.trackKey);
+				return local ? {
+					url: `/dsh-alger/local?trackKey=${encodeURIComponent(track.trackKey)}`,
+					sourceKey: 'local-library',
+					confidence: 1
+				} : null;
+			} : null,
+			direct: async (track) => {
+				const id = Number(track?.raw?.id);
+				if (!id) return null;
+				const url = await client.songUrl(id, 'higher');
+				return url ? { url, sourceKey: 'netease', confidence: 1, expiresAt: Date.now() + 4 * 60 * 1000 } : null;
+			},
+			cross: async (track, options) => {
+				const requested = options?.requested;
+				const title = requested?.title ?? track.title;
+				const artist = requested?.artists?.[0] ?? track.artists?.[0] ?? '';
+				const hit = await matchSourceByKeyword(title, artist, null, options?.durationMs ?? 0);
+				return hit ? {
+					url: hit.url,
+					sourceKey: hit.source || 'cross-source',
+					confidence: 0.95,
+					matchedIdentity: requested ?? track,
+					expiresAt: Date.now() + 4 * 60 * 1000
+				} : null;
+			}
+		});
+	} catch (error) {
+		console.warn('[dsh-moony-singer] 音源解析器初始化失败: ' + ((error && error.message) || String(error)));
+	}
+	try {
+		if (tasteProfile && sourceResolver) {
+			coordinator = createRecommendationCoordinator({
+				player,
+				profile: tasteProfile,
+				client,
+				localLibrary,
+				retrievers: createRetrievers({ client, localLibrary, timeoutMs: Math.min(cfg.timeoutMs, 3500) }),
+				resolver: sourceResolver,
+				targetSize: Math.max(1, Math.min(30, Number(cfg.recommendationTargetSize) || 15)),
+				timeoutMs: Math.max(3000, Number(cfg.timeoutMs) || 20000)
+			});
+		}
+	} catch (error) {
+		console.warn('[dsh-moony-singer] 推荐协调器初始化失败: ' + ((error && error.message) || String(error)));
+	}
 
 	// 内置音乐 API 服务（netease-cloud-music-api-alger）自动启动
 	const apiHandle = {
@@ -1453,7 +1514,11 @@ export function apply(ctx, config) {
 		return best;
 	};
 
-	const actions = buildActions(cfg, client, shared, player, apiHandle, habits);
+	const actions = buildActions(cfg, client, shared, player, apiHandle, habits, {
+		coordinator,
+		preference: tasteProfile ? createPreferenceAction(tasteProfile) : null,
+		localLibrary
+	});
 	const disposers = [];
 	for (const definition of buildTools(cfg, actions)) {
 		disposers.push(ctx.tools.register(definition));
@@ -1464,6 +1529,7 @@ export function apply(ctx, config) {
 	}
 	if (typeof ctx.on === 'function') {
 		ctx.on('dispose', () => {
+			coordinator?.cancel('plugin disposed');
 			for (const dispose of disposers) dispose();
 			if (apiHandle && apiHandle.handle) {
 				stopApiServer(apiHandle.handle).catch(() => {});
@@ -1471,4 +1537,3 @@ export function apply(ctx, config) {
 		});
 	}
 }
-
