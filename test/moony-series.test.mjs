@@ -204,6 +204,15 @@ test('queue song row exposes one lightweight remove control that does not select
 	assert.deepEqual(events, ['stop', 'remove:2']);
 });
 
+test('cross-source search rows add by their verified keyword instead of the synthetic zero id', () => {
+	const { queuePayloadForSearchItem } = loadClient();
+	assert.deepEqual(
+		Object.values(queuePayloadForSearchItem({ id: 0, crossSource: true, playKeyword: '周杰伦 晴天' })),
+		['add', '周杰伦 晴天']
+	);
+	assert.deepEqual(Object.values(queuePayloadForSearchItem({ id: 123 })), ['add', 123]);
+});
+
 test('resolver falls back to Classic, idle, and a blank face', () => {
 	const { resolveMoonyState } = loadClient();
 	const value = resolveMoonyState({ petId: 'missing', agentStatus: 'unknown', mediaUrl: '' });

@@ -348,6 +348,13 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
+		function queuePayloadForSearchItem(item) {
+			if (item && item.crossSource && typeof item.playKeyword === "string" && item.playKeyword.trim()) {
+				return { action: "add", keyword: item.playKeyword.trim() };
+			}
+			return { action: "add", songId: item && item.id };
+		}
+
 		/* ---------- 微信分享面板（朋友无需安装插件） ----------
 		 * 网易云公开链接 + 剪贴板复制 + 二维码（二维码走公共服务，失败自动降级隐藏，
 		 * 分享核心链路始终可用：复制链接 → 微信粘贴 → 自动渲染歌曲卡片）。
@@ -1585,7 +1592,7 @@ window.__ModuleLoader__.load({
 			// 双击歌曲：追加到播放列表末尾并立即播放（不关闭搜索列表，可连续双击多首）
 			var onPlaySong = function (item) {
 				setBusy(true);
-				queueApi({ action: "add", songId: item.id }).then(function (r) {
+				queueApi(queuePayloadForSearchItem(item)).then(function (r) {
 					if (!r || !r.ok) { setBusy(false); flash("err", (r && r.guidance) || (r && r.error) || "添加失败"); return; }
 					// 追加后它位于队尾：queueLength-1
 					var idx = (r.queueLength || 1) - 1;
@@ -2258,6 +2265,7 @@ window.__ModuleLoader__.load({
 		exports.FavoriteCollectionPanel = FavoriteCollectionPanel;
 		exports.FavoriteMembershipPicker = FavoriteMembershipPicker;
 		exports.QueueSongRow = QueueSongRow;
+		exports.queuePayloadForSearchItem = queuePayloadForSearchItem;
 		return module.exports;
 	}
 });

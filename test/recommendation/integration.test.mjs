@@ -89,6 +89,36 @@ test('real actions organize collections and resolve playback after removing the 
 	assert.equal((await actions.queue({ action: 'undo-remove', token: removed.token })).restored.id, 1);
 });
 
+test('cross-source search results remain playable when added from the client queue', async () => {
+	const player = createPlayer({ file: null });
+	const cover = { id: 77, name: '晴天', ar: [{ name: 'A-Lin' }], al: { name: '翻唱' }, dt: 240000 };
+	const client = {
+		musicApiUp: async () => true,
+		search: async () => ({ songs: [cover] }),
+		songUrl: async () => null
+	};
+	const matchSourceByKeyword = async (name, artist) => ({
+		url: 'https://audio.test/jay-qingtian.mp3', source: 'migu', title: name || '晴天', artist
+	});
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		client, {}, player, {}, { recordPlayback: async () => {} }, { matchSourceByKeyword }
+	);
+
+	const searched = await actions.search({ keywords: '周杰伦 晴天', type: 1 });
+	assert.equal(searched.items[0].crossSource, true);
+	assert.equal(searched.items[0].playKeyword, '周杰伦 晴天');
+
+	const added = await actions.queue({ action: 'add', keyword: searched.items[0].playKeyword });
+	assert.equal(added.ok, true);
+	assert.equal(player.state.queue[0].name, '晴天');
+	assert.equal(player.state.queue[0].ar[0].name, '周杰伦');
+	assert.equal(player.state.queue[0].resolvedUrl, 'https://audio.test/jay-qingtian.mp3');
+	player.jump(0);
+	assert.equal((await actions.queue({ action: 'jump', index: 0 })).ok, true);
+	assert.equal(player.state.currentUrl, 'https://audio.test/jay-qingtian.mp3');
+});
+
 test('tool copy preserves natural dialogue and only recommends on an explicit request', () => {
 	const noop = async () => ({ ok: true });
 	const actions = new Proxy({ preference: noop }, { get: (target, key) => target[key] ?? noop });

@@ -156,6 +156,7 @@ function normalize(s) {
 function buildActions(cfg, client, shared, player, apiHandle, habits, recommendation = {}) {
 	const coordinator = recommendation.coordinator ?? null;
 	const preference = recommendation.preference ?? null;
+	const matchByKeyword = recommendation.matchSourceByKeyword ?? matchSourceByKeyword;
 	const feedback = (type, song) => {
 		if (!cfg.recommendationLearning || !coordinator || !song) return;
 		const track = song.trackKey ? song : normalizeTrack(song, 'player');
@@ -239,7 +240,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					artists: song?.ar ?? song?.artists,
 					durationMs: song?.dt
 				}, { title: parts.name, artists: parts.artist ? [parts.artist] : [] });
-				const hit = await matchSourceByKeyword(parts.name || kw, parts.artist, null, duration);
+				const hit = await matchByKeyword(parts.name || kw, parts.artist, null, duration);
 				if (hit && hit.url) {
 					// 关键词匹配到的是原版：显示名用「匹配标题 + 关键词歌手」，替换列表里的翻唱信息
 					const listName = song && song.name ? String(song.name).trim() : '';
@@ -366,6 +367,32 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			let items = [];
 			if (type === 1) {
 				items = (result.songs || []).map((s) => compactSong(s));
+				// 网易云单源搜不到/全是翻唱（歌手不精确命中）时，用跨源聚合补「真原版」（如周杰伦）。
+				// 只在「带歌手的关键词」且网易云结果里没有该歌手精确条目时补一条，避免常规搜索被污染。
+				try {
+					const kParts = splitKeyword(keywords);
+					const exactArtist = String(kParts.artist || '').trim().toLowerCase();
+					const hasExactArtist = exactArtist && items.some((it) =>
+						String(it.artists || '').split(/[\/\s，,、]+/).some((t) => t.trim().toLowerCase() === exactArtist)
+					);
+					if (exactArtist && !hasExactArtist) {
+						const hit = await matchByKeyword(kParts.name || keywords, kParts.artist, null, 0);
+						if (hit && hit.url) {
+							items.unshift({
+								id: 0,
+								name: hit.title || kParts.name || keywords,
+								artists: kParts.artist,
+								album: '',
+								durationMs: null,
+								picUrl: '',
+								source: hit.source || '',
+								crossSource: true,
+								playKeyword: keywords,
+								desc: (hit.source || '跨源') + ' · 原版，点歌用「' + (kParts.name || keywords) + ' ' + kParts.artist + '」'
+							});
+						}
+					}
+				} catch { /* 跨源搜索失败不影响主结果 */ }
 			} else if (type === 10) {
 				items = (result.albums || []).map((a) => ({
 					id: a.id,
@@ -638,9 +665,24 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					const r = await client.search(keyword, 1, 8);
 					const list = r.songs || [];
 					if (list.length === 0) return { ok: false, steps: [...steps, `搜索「${keyword}」无结果`], guidance: '换个关键词试试。' };
-					const nk = normalize(keyword);
-					const song = list.find((s) => normalize(s.name) === nk) || list[0];
-					songs = [song];
+					const parts = splitKeyword(keyword);
+					const wantedName = normalize(parts.name || keyword);
+					const artistMatches = (candidate) => !parts.artist || ((candidate.ar || candidate.artists) || [])
+						.some((artist) => normalize(artist?.name).includes(normalize(parts.artist)) || normalize(parts.artist).includes(normalize(artist?.name)));
+					let song = list.find((candidate) => normalize(candidate.name) === wantedName && artistMatches(candidate))
+						|| list.find((candidate) => normalize(candidate.name) === wantedName)
+						|| list[0];
+					const hit = await urlFor(song, keyword);
+					if (!hit) return { ok: false, steps: [...steps, `「${song.name}」暂无可用播放地址`], guidance: '换一首试试。' };
+					if (hit.matchTitle) {
+						song = {
+							...song,
+							name: hit.matchTitle,
+							ar: hit.matchArtist ? [{ id: 0, name: hit.matchArtist }] : (song.ar || []),
+							artists: hit.matchArtist ? [{ id: 0, name: hit.matchArtist }] : (song.artists || [])
+						};
+					}
+					songs = [{ ...song, resolvedUrl: hit.url }];
 					log(`搜索「${keyword}」选中: [${song.id}] ${song.name} - ${(song.ar || []).map((a) => a.name).join('/')}`);
 				} else {
 					throw new Error('add / add-next 需要 songId 或 keyword。');
