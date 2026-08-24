@@ -79,6 +79,23 @@ test('recommend action consumes 30 cached tracks without invoking click-time gen
 	assert.equal(player.state.queue.at(-1).name, '手动');
 });
 
+test('status exposes recommendation pool readiness without starting generation', async () => {
+	let generationCalls = 0;
+	const player = createPlayer({ file: null });
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} },
+		{
+			pool: { snapshot: async () => ({ ready: true, count: 60, items: Array(60) }) },
+			scheduler: { status: () => ({ state: 'idle', generating: false, scheduled: false, lastError: null }) },
+			coordinator: { recommend: async () => { generationCalls += 1; } }
+		}
+	);
+	const status = await actions.status();
+	assert.deepEqual(status.recommendation, { ready: true, count: 60, generating: false, lastError: null });
+	assert.equal(generationCalls, 0);
+});
+
 test('strong preference signals schedule refresh while skip and completion only update history', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([
@@ -224,6 +241,10 @@ test('client recommendation button sends request ids and ignores stale responses
 	assert.match(source, /recommendRequestRef/);
 	assert.match(source, /requestId:\s*requestId/);
 	assert.match(source, /recommendRequestRef\.current\s*!==\s*requestId/);
+	assert.match(source, /state\.recommendation\.ready/);
+	assert.match(source, /准备中/);
+	assert.match(source, /已推荐.*30 首/);
+	assert.doesNotMatch(source, /成功时结果由宠物气泡播报/);
 });
 
 test('profile data follows DSH_HOME instead of leaking across isolated profiles', () => {

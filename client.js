@@ -1066,6 +1066,8 @@ window.__ModuleLoader__.load({
 			React.useEffect(function () { return onPetHidden(setHidden); }, []);
 			var [notice, setNotice] = React.useState(null); // {kind:'ok'|'err'|'', text}
 			var [busy, setBusy] = React.useState(false);
+			var [recommendBusy, setRecommendBusy] = React.useState(false);
+			var [recommendLabel, setRecommendLabel] = React.useState(null);
 			var recommendRequestRef = React.useRef(0);
 			var [lrc, setLrc] = React.useState(null); // [{t,text}] 当前歌歌词
 			var [lyricsOpen, setLyricsOpen] = React.useState(false); // 展开视图歌词面板
@@ -1428,18 +1430,22 @@ window.__ModuleLoader__.load({
 			// 推荐播放：不知道听什么时一键推荐
 			var onRecommend = function () {
 				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
+				if (!state.recommendation || !state.recommendation.ready) { flash("", "推荐正在准备中"); return; }
 				var requestId = "recommend-" + Date.now() + "-" + (recommendRequestRef.current + 1);
 				recommendRequestRef.current = requestId;
-				setBusy(true);
+				setRecommendBusy(true);
 				post("/dsh-alger/recommend", { requestId: requestId }).then(function (r) {
 					if (recommendRequestRef.current !== requestId) return;
-					setBusy(false);
-					if (r && !r.ok) flash("err", (r && r.guidance) || (r && r.error) || "推荐失败");
-					// 成功时结果由宠物气泡播报（服务端 notice）
-					setTimeout(refresh, 600);
+					setRecommendBusy(false);
+					if (r && !r.ok) flash(r.preparing ? "" : "err", (r && r.guidance) || (r && r.error) || "推荐失败");
+					else {
+						setRecommendLabel("已推荐 30 首");
+						setTimeout(function () { setRecommendLabel(null); }, 1800);
+					}
+					setTimeout(refresh, 120);
 				}).catch(function () {
 					if (recommendRequestRef.current !== requestId) return;
-					setBusy(false);
+					setRecommendBusy(false);
 					flash("err", "推荐失败");
 				});
 			};
@@ -1896,7 +1902,12 @@ window.__ModuleLoader__.load({
 								disabled: !canControl || busy,
 								onClick: toggleFavorites
 							}, "收藏"),
-							h("button", { className: "dsa-btn dsa-mode", title: "推荐播放（不知道听什么时用）", disabled: !canControl || busy, onClick: onRecommend }, "推荐"),
+							h("button", {
+								className: "dsa-btn dsa-mode",
+								title: state && state.recommendation && state.recommendation.ready ? "立即推荐 30 首" : "后台正在准备推荐",
+								disabled: !canControl || busy || recommendBusy || !(state && state.recommendation && state.recommendation.ready),
+								onClick: onRecommend
+							}, recommendBusy ? "推荐中" : (recommendLabel || (state && state.recommendation && state.recommendation.ready ? "推荐" : "准备中"))),
 														h("button", { className: "dsa-btn", title: "上一首", disabled: !canControl, onClick: function () { runCommand("prev"); } }, ICONS.prev),
 							h("button", {
 								className: "dsa-btn dsa-btn-primary",

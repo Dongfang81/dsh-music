@@ -230,7 +230,11 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 	return {
 		/** alger_status */
 		async status() {
-			const musicApiUp = await apiUp();
+			const [musicApiUp, poolState] = await Promise.all([
+				apiUp(),
+				pool ? pool.snapshot().catch(() => null) : Promise.resolve(null)
+			]);
+			const schedulerState = scheduler?.status?.() ?? null;
 			const snap = player.snapshot();
 			return {
 				ok: true,
@@ -250,6 +254,12 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				ready: snap.ready,
 				notice: shared.getNotice ? shared.getNotice() : null,
 				agentStatus: shared.getAgentStatus ? shared.getAgentStatus() : 'idle',
+				recommendation: {
+					ready: Boolean(poolState?.ready),
+					count: Number(poolState?.count ?? poolState?.items?.length) || 0,
+					generating: Boolean(schedulerState?.generating || schedulerState?.scheduled),
+					lastError: schedulerState?.lastError ?? null
+				},
 				queue: snap.queue
 			};
 		},
