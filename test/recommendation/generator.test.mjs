@@ -70,6 +70,28 @@ test('preserves a complete old pool when a new generation cannot reach 60', asyn
 	assert.equal((await shortPool.snapshot()).generationId, 'old');
 });
 
+test('tops up an incomplete pool with new verified tracks instead of replacing all 58 songs', async () => {
+	const dir = await mkdtemp(join(tmpdir(), 'moony-top-up-generator-'));
+	const pool = createRecommendationPool({ file: join(dir, 'pool.json') });
+	await pool.replace(tracks(58, 1000), { generationId: 'incomplete' });
+	const generator = createRecommendationGenerator({
+		pool,
+		player: { current: () => null, state: { queue: [] } },
+		profile: { snapshot: async () => ({ tracks: {}, artists: {}, rules: [], resolverStats: {} }) },
+		collectCandidates: async () => ({ tracks: tracks(2, 2000), failures: [] }),
+		rankCandidates: ({ candidates }) => candidates.map((track, index) => ({ track, total: 10 - index })),
+		planQueue: ({ ranked, targetSize }) => ({ tracks: ranked.slice(0, targetSize).map((entry) => entry.track) }),
+		resolver: { resolve: async (track) => ({ playable: true, url: `https://temporary/${track.trackKey}` }) },
+		targetSize: 60
+	});
+
+	const result = await generator.generate({ reasons: ['startup'] });
+	const state = await pool.snapshot();
+	assert.equal(result.ok, true);
+	assert.equal(state.items.length, 60);
+	assert.deepEqual(state.items.slice(0, 2).map((track) => track.trackKey), tracks(2, 2000).map((track) => track.trackKey));
+});
+
 test('returns an honest failure and keeps the pool when candidate collection fails', async () => {
 	const { pool } = await fixture();
 	await pool.replace(tracks(60, 2000), { generationId: 'old' });
