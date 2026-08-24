@@ -93,3 +93,69 @@ test('custom collections support multiple memberships without changing global fa
 	assert.deepEqual(player.favoriteCollection('all').songs.map((item) => item.id), [2]);
 	assert.deepEqual(player.favoriteCollection('night').songs.map((item) => item.id), [2]);
 });
+
+test('removing a non-current queue item preserves the active song and undo restores order', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '一'), song(2, '二'), song(3, '三'), song(4, '四')]);
+	player.jump(2);
+
+	const removed = player.removeQueueAt(0);
+	assert.equal(removed.removed.id, 1);
+	assert.equal(removed.currentChanged, false);
+	assert.equal(player.current().id, 3);
+	assert.equal(player.state.index, 1);
+	assert.deepEqual(player.state.queue.map((item) => item.id), [2, 3, 4]);
+
+	const restored = player.undoQueueRemoval(removed.token);
+	assert.equal(restored.restored.id, 1);
+	assert.equal(player.current().id, 3);
+	assert.equal(player.state.index, 2);
+	assert.deepEqual(player.state.queue.map((item) => item.id), [1, 2, 3, 4]);
+
+	const after = player.removeQueueAt(3);
+	assert.equal(after.currentChanged, false);
+	assert.equal(player.current().id, 3);
+});
+
+test('removing the current queue item advances to next, falls back to previous, then stops when empty', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '一'), song(2, '二'), song(3, '三')]);
+	player.jump(1);
+	player.toggleFavorite();
+
+	const middle = player.removeQueueAt(1);
+	assert.equal(middle.currentChanged, true);
+	assert.equal(player.current().id, 3);
+	assert.equal(player.state.index, 1);
+	assert.equal(player.state.playing, true);
+	assert.deepEqual(player.state.favorites.map((item) => item.id), [2]);
+
+	player.undoQueueRemoval(middle.token);
+	assert.deepEqual(player.state.queue.map((item) => item.id), [1, 2, 3]);
+	assert.equal(player.current().id, 3, 'undo restores the row without interrupting the song that took over');
+	assert.equal(player.state.index, 2);
+
+	const last = player.removeQueueAt(2);
+	assert.equal(last.currentChanged, true);
+	assert.equal(player.current().id, 2);
+	assert.equal(player.state.index, 1);
+
+	player.removeQueueAt(1);
+	const only = player.removeQueueAt(0);
+	assert.equal(only.currentChanged, true);
+	assert.equal(player.current(), null);
+	assert.equal(player.state.index, -1);
+	assert.equal(player.state.playing, false);
+	assert.equal(player.state.currentUrl, null);
+});
+
+test('queue removal validates indices and only the latest removal can be undone', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '一'), song(2, '二'), song(3, '三')]);
+	assert.throws(() => player.removeQueueAt(-1), /下标/);
+	assert.throws(() => player.removeQueueAt(3), /下标/);
+	const first = player.removeQueueAt(2);
+	const second = player.removeQueueAt(1);
+	assert.throws(() => player.undoQueueRemoval(first.token), /已失效/);
+	assert.equal(player.undoQueueRemoval(second.token).restored.id, 2);
+});
