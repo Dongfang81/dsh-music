@@ -49,49 +49,20 @@ test('recommendation starts its first verified track when nothing is active', ()
 	assert.equal(player.state.playing, true);
 });
 
-test('legacy favorites load into an immutable virtual all collection', (t) => {
+test('favorites stay as one flat list when loading state written by the collection experiment', (t) => {
 	const directory = mkdtempSync(join(tmpdir(), 'moony-player-'));
 	t.after(() => rmSync(directory, { recursive: true, force: true }));
 	const file = join(directory, 'state.json');
-	writeFileSync(file, JSON.stringify({ favorites: [song(1, '晴天'), song(2, '夜曲')] }));
+	writeFileSync(file, JSON.stringify({
+		favorites: [song(1, '晴天'), song(2, '夜曲')],
+		favoriteCollections: [{ id: 'focus', name: '工作', songIds: [1] }]
+	}));
 
 	const player = createPlayer({ file });
-	assert.deepEqual(player.listFavoriteCollections(), [{
-		id: 'all', name: '全部收藏', songIds: [1, 2], count: 2, system: true
-	}]);
-	assert.deepEqual(player.favoriteCollection('all').songs.map((item) => item.id), [1, 2]);
-	assert.throws(() => player.renameFavoriteCollection('all', '别的名字'), /不能重命名/);
-	assert.throws(() => player.deleteFavoriteCollection('all'), /不能删除/);
-});
-
-test('custom collections support multiple memberships without changing global favorite semantics', () => {
-	const ids = ['focus', 'night'];
-	const player = createPlayer({ file: null, createCollectionId: () => ids.shift() });
-	player.replaceAndPlay([song(1, '晴天'), song(2, '夜曲')]);
-	player.toggleFavorite();
-	player.jump(1);
-	player.toggleFavorite();
-
-	const focus = player.createFavoriteCollection('工作');
-	const night = player.createFavoriteCollection('夜晚');
-	assert.equal(focus.id, 'focus');
-	assert.equal(night.id, 'night');
-	player.setFavoriteMemberships(1, ['focus', 'night']);
-	player.setFavoriteMemberships(2, ['night']);
-	assert.deepEqual(player.favoriteCollection('focus').songs.map((item) => item.id), [1]);
-	assert.deepEqual(player.favoriteCollection('night').songs.map((item) => item.id), [1, 2]);
-
-	player.renameFavoriteCollection('focus', '专注');
-	assert.equal(player.favoriteCollection('focus').name, '专注');
-	assert.throws(() => player.createFavoriteCollection(' 专注 '), /已存在/);
-	player.deleteFavoriteCollection('focus');
 	assert.deepEqual(player.state.favorites.map((item) => item.id), [1, 2]);
-
-	player.jump(0);
-	const unfavorited = player.toggleFavorite();
-	assert.equal(unfavorited.favorite, false);
-	assert.deepEqual(player.favoriteCollection('all').songs.map((item) => item.id), [2]);
-	assert.deepEqual(player.favoriteCollection('night').songs.map((item) => item.id), [2]);
+	assert.equal(player.state.favoriteCollections, undefined);
+	assert.equal(player.snapshot().favoriteCollections, undefined);
+	assert.equal(player.playFavorites().count, 2);
 });
 
 test('removing a non-current queue item preserves the active song and undo restores order', () => {

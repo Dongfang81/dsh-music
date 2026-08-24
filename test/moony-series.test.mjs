@@ -126,67 +126,16 @@ test('audio buffering bindings start on starvation events and clear on recovery'
 	assert.equal(removed.length, 9);
 });
 
-test('heart long press opens organization without also firing the one-click favorite action', () => {
-	const { createLongPressHandlers } = loadClient();
-	const scheduled = [];
-	const timerRef = { current: null };
-	const triggeredRef = { current: false };
+test('favorite heart is a one-click toggle with no organization gesture', () => {
+	const { FavoriteHeartButton } = loadClient();
 	const events = [];
-	const handlers = createLongPressHandlers({
-		timerRef,
-		triggeredRef,
-		setTimer(callback) { scheduled.push(callback); return scheduled.length; },
-		clearTimer() {},
-		onLongPress() { events.push('organize'); },
-		onClick() { events.push('favorite'); }
-	});
-
-	handlers.onPointerDown();
-	scheduled[0]();
-	handlers.onPointerUp();
-	handlers.onClick({ preventDefault() {} });
-	assert.deepEqual(events, ['organize']);
-
-	handlers.onPointerDown();
-	handlers.onPointerUp();
-	handlers.onClick({ preventDefault() {} });
-	assert.deepEqual(events, ['organize', 'favorite']);
-});
-
-test('favorite collection panel keeps all immutable and exposes organization on every song', () => {
-	const { FavoriteCollectionPanel } = loadClient();
-	const collections = [
-		{ id: 'all', name: '全部收藏', count: 2, system: true },
-		{ id: 'focus', name: '工作', count: 1 }
-	];
-	const songs = [
-		{ id: 1, name: '晴天', artists: '周杰伦' },
-		{ id: 2, name: '夜曲', artists: '周杰伦' }
-	];
-	const all = FavoriteCollectionPanel({ collections, activeId: 'all', songs });
-	assert.equal(findNodes(all, (node) => node.type === 'button' && node.props?.children === '收藏到…').length, 2);
-	assert.equal(findNodes(all, (node) => node.props?.['data-collection-rename']).length, 0);
-	assert.equal(findNodes(all, (node) => node.props?.['data-collection-delete']).length, 0);
-
-	const custom = FavoriteCollectionPanel({ collections, activeId: 'focus', songs: [songs[0]] });
-	assert.equal(findNodes(custom, (node) => node.props?.['data-collection-rename']).length, 1);
-	assert.equal(findNodes(custom, (node) => node.props?.['data-collection-delete']).length, 1);
-});
-
-test('favorite membership picker supports multiple custom collections and never treats all as assignable', () => {
-	const { FavoriteMembershipPicker } = loadClient();
-	const tree = FavoriteMembershipPicker({
-		song: { id: 1, name: '晴天' },
-		collections: [
-			{ id: 'all', name: '全部收藏', songIds: [1], system: true },
-			{ id: 'focus', name: '工作', songIds: [1] },
-			{ id: 'night', name: '夜晚', songIds: [] }
-		]
-	});
-	const boxes = findNodes(tree, (node) => node.type === 'input' && node.props?.type === 'checkbox');
-	assert.deepEqual(boxes.map((node) => node.props.value), ['focus', 'night']);
-	assert.deepEqual(boxes.map((node) => node.props.defaultChecked), [true, false]);
-	assert.equal(findNodes(tree, (node) => node.type === 'button' && node.props?.children === '保存').length, 1);
+	const tree = FavoriteHeartButton({ active: true, disabled: false, onToggle() { events.push('favorite'); } });
+	assert.equal(tree.type, 'button');
+	assert.equal(tree.props.title, '收藏/取消收藏当前歌曲');
+	assert.equal(tree.props.onPointerDown, undefined);
+	assert.equal(tree.props.onPointerUp, undefined);
+	tree.props.onClick();
+	assert.deepEqual(events, ['favorite']);
 });
 
 test('queue song row exposes one lightweight remove control that does not select the row', () => {
@@ -204,13 +153,15 @@ test('queue song row exposes one lightweight remove control that does not select
 	assert.deepEqual(events, ['stop', 'remove:2']);
 });
 
-test('cross-source search rows add by their verified keyword instead of the synthetic zero id', () => {
+test('search rows add by their catalog song id', () => {
 	const { queuePayloadForSearchItem } = loadClient();
-	assert.deepEqual(
-		Object.values(queuePayloadForSearchItem({ id: 0, crossSource: true, playKeyword: '周杰伦 晴天' })),
-		['add', '周杰伦 晴天']
-	);
 	assert.deepEqual(Object.values(queuePayloadForSearchItem({ id: 123 })), ['add', 123]);
+});
+
+test('an empty strict search surfaces the server guidance instead of looking broken', () => {
+	const { searchFeedbackForResponse } = loadClient();
+	assert.equal(searchFeedbackForResponse({ ok: true, items: [], guidance: '没有找到可靠原唱。' }), '没有找到可靠原唱。');
+	assert.equal(searchFeedbackForResponse({ ok: true, items: [{ id: 1 }] }), null);
 });
 
 test('resolver falls back to Classic, idle, and a blank face', () => {

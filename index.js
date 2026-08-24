@@ -32,7 +32,6 @@ import { createClient } from './lib/alger.js';
 import { createPlayer } from './lib/player.js';
 import { createHabits } from './lib/habits.js';
 import { startApiServer, stopApiServer } from './lib/api-server.js';
-import { matchSourceUrl, matchSourceByKeyword, safeCrossSourceDuration } from './lib/source-match.js';
 import { normalizeTrack } from './lib/recommendation/identity.js';
 import { createTasteProfile } from './lib/recommendation/profile.js';
 import { createLocalLibrary } from './lib/recommendation/local-library.js';
@@ -156,7 +155,6 @@ function normalize(s) {
 function buildActions(cfg, client, shared, player, apiHandle, habits, recommendation = {}) {
 	const coordinator = recommendation.coordinator ?? null;
 	const preference = recommendation.preference ?? null;
-	const matchByKeyword = recommendation.matchSourceByKeyword ?? matchSourceByKeyword;
 	const feedback = (type, song) => {
 		if (!cfg.recommendationLearning || !coordinator || !song) return;
 		const track = song.trackKey ? song : normalizeTrack(song, 'player');
@@ -195,12 +193,8 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		return { name: s, artist: '' };
 	}
 
-	/** 取歌曲直链（多级兜底）：
-	 *  1) 音乐 API 直链（有版权且歌手与关键词一致时，避免命中翻唱版的直链）；
-	 *  2) 歌曲元数据从其他平台匹配（仅当关键词歌手与歌曲一致时）；
-	 *  3) 原始关键词匹配（网易云下架/列表只有翻唱时，按「歌名 - 歌手」拿原版音源）。
-	 *  返回 { url, displayName? }；displayName 为关键词匹配到的原版标题（与列表歌名不同时提供）；
-	 *  无法播放返回 null。 */
+	/** 取歌曲直链：只接受主音乐 API 已确认歌曲身份的官方直链。
+	 * 第三方关键词跨源匹配暂时熔断，避免把翻唱、伴奏或个人上传冒充原唱。 */
 	async function urlFor(song, keyword) {
 		if (song?.resolvedUrl) return { url: song.resolvedUrl };
 		const kw = String(keyword || '').trim();
@@ -220,48 +214,6 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				if (url) return { url };
 			} catch {
 				/* 继续兜底 */
-			}
-		}
-		// 2) 歌曲元数据 → 多平台匹配（歌手一致才用，避免匹配到翻唱版）
-		if (song && song.name && consistent) {
-			try {
-				const url = await matchSourceUrl(song);
-				if (url) return { url };
-			} catch {
-				/* 继续兜底 */
-			}
-		}
-		// 3) 原始关键词 → 多平台匹配（覆盖网易云下架/翻唱场景，按「歌名 - 歌手」拿原版）
-		if (kw) {
-			try {
-				// 只有标题和歌手 token 都精确匹配时才借用候选时长；翻唱/部分命中必须传 0。
-				const duration = safeCrossSourceDuration({
-					title: song?.name,
-					artists: song?.ar ?? song?.artists,
-					durationMs: song?.dt
-				}, { title: parts.name, artists: parts.artist ? [parts.artist] : [] });
-				const hit = await matchByKeyword(parts.name || kw, parts.artist, null, duration);
-				if (hit && hit.url) {
-					// 关键词匹配到的是原版：显示名用「匹配标题 + 关键词歌手」，替换列表里的翻唱信息
-					const listName = song && song.name ? String(song.name).trim() : '';
-					const hitName = hit.title ? String(hit.title).trim() : parts.name || '';
-					const artistName = parts.artist || '';
-					const listArtist = songArtists || '';
-					const sameName = !listName || hitName === listName;
-					const sameArtist = !artistName || !listArtist || listArtist.includes(artistName) || artistName.includes(listArtist.split(/\s+/)[0] || '');
-					// 歌名或歌手任一与列表不一致 → 带上 displayName（「歌名 - 歌手」格式）与结构化信息
-					if (!sameName || !sameArtist) {
-						return {
-							url: hit.url,
-							displayName: artistName ? hitName + ' - ' + artistName : hitName,
-							matchTitle: hitName,
-							matchArtist: artistName
-						};
-					}
-					return { url: hit.url };
-				}
-			} catch {
-				/* 返回 null */
 			}
 		}
 		return null;
@@ -284,7 +236,6 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				favorite: snap.favorite,
 				favoriteIds: snap.favoriteIds,
 				favoriteCount: snap.favoriteCount,
-				favoriteCollections: snap.favoriteCollections,
 				playMode: snap.playMode,
 				volume: snap.volume,
 				currentUrl: snap.currentUrl,
@@ -365,34 +316,22 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const limit = Math.min(50, Math.max(1, Number(args?.limit) || 10));
 			const result = await client.search(keywords, type, limit);
 			let items = [];
+			let guidance;
 			if (type === 1) {
 				items = (result.songs || []).map((s) => compactSong(s));
-				// 网易云单源搜不到/全是翻唱（歌手不精确命中）时，用跨源聚合补「真原版」（如周杰伦）。
-				// 只在「带歌手的关键词」且网易云结果里没有该歌手精确条目时补一条，避免常规搜索被污染。
-				try {
-					const kParts = splitKeyword(keywords);
-					const exactArtist = String(kParts.artist || '').trim().toLowerCase();
-					const hasExactArtist = exactArtist && items.some((it) =>
-						String(it.artists || '').split(/[\/\s，,、]+/).some((t) => t.trim().toLowerCase() === exactArtist)
-					);
-					if (exactArtist && !hasExactArtist) {
-						const hit = await matchByKeyword(kParts.name || keywords, kParts.artist, null, 0);
-						if (hit && hit.url) {
-							items.unshift({
-								id: 0,
-								name: hit.title || kParts.name || keywords,
-								artists: kParts.artist,
-								album: '',
-								durationMs: null,
-								picUrl: '',
-								source: hit.source || '',
-								crossSource: true,
-								playKeyword: keywords,
-								desc: (hit.source || '跨源') + ' · 原版，点歌用「' + (kParts.name || keywords) + ' ' + kParts.artist + '」'
-							});
-						}
+				const requested = splitKeyword(keywords);
+				if (requested.artist) {
+					const title = normalize(requested.name);
+					const artist = normalize(requested.artist);
+					items = items.filter((item) => {
+						const exactTitle = normalize(item.name) === title;
+						const artistNames = String(item.artists || '').split(/[\/，,、;&；]+/).map(normalize).filter(Boolean);
+						return exactTitle && artistNames.includes(artist);
+					});
+					if (items.length === 0) {
+						guidance = `没有找到歌手和歌名都完全匹配「${requested.artist} - ${requested.name}」的可靠原唱。`;
 					}
-				} catch { /* 跨源搜索失败不影响主结果 */ }
+				}
 			} else if (type === 10) {
 				items = (result.albums || []).map((a) => ({
 					id: a.id,
@@ -414,7 +353,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					desc: (m.artists || []).map((x) => x.name).join('/')
 				}));
 			}
-			return { ok: true, keyword: keywords, type, total: items.length, items };
+			return { ok: true, keyword: keywords, type, total: items.length, items, ...(guidance ? { guidance } : {}) };
 		},
 
 		/** alger_song */
@@ -558,7 +497,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				throw new Error('请提供 keyword 或 songId（二选一）。');
 			}
 
-			// 2) 确认可播放（多级兜底：网易云直链 → 元数据匹配 → 原始关键词匹配）
+			// 2) 确认可播放（只接受主音乐 API 对当前歌曲返回的直链）
 			const hit = await urlFor(song, keyword);
 			if (!hit) {
 				return {
@@ -570,15 +509,6 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const url = hit.url;
 
 			// 3) 写入播放状态（客户端轮询到 currentUrl 后自动播放）
-			// 关键词匹配到原版时，歌曲信息修正为「原版标题 - 歌手」（如 A-LNK 版 → 晴天 - 周杰伦）
-			if (hit.matchTitle) {
-				song = {
-					...song,
-					name: hit.matchTitle,
-					ar: hit.matchArtist ? [{ id: 0, name: hit.matchArtist }] : (song.ar || []),
-					artists: hit.matchArtist ? [{ id: 0, name: hit.matchArtist }] : (song.artists || [])
-				};
-			}
 			player.playSong(song);
 			player.state.currentUrl = url;
 			feedback('search-play', song);
@@ -726,51 +656,6 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const n = player.append(songs);
 			shared.setNotice('＋ 已加入播放列表 ' + songs.length + ' 首');
 			return { ok: true, steps, mode, added: songs.length, queueLength: n, playedName: null };
-		},
-
-		/** 收藏集整理：全局收藏仍只由红心 toggle-favorite 控制。 */
-		async favorites(args) {
-			const action = String(args?.action ?? 'list');
-			if (action === 'list') {
-				const collection = player.favoriteCollection(String(args?.collectionId || 'all'));
-				return {
-					ok: true,
-					collections: player.listFavoriteCollections(),
-					collection: { id: collection.id, name: collection.name, count: collection.count, system: Boolean(collection.system) },
-					songs: collection.songs.map(compactSong)
-				};
-			}
-			if (action === 'create') {
-				return { ok: true, collection: player.createFavoriteCollection(args?.name), collections: player.listFavoriteCollections() };
-			}
-			if (action === 'rename') {
-				return { ok: true, collection: player.renameFavoriteCollection(args?.collectionId, args?.name), collections: player.listFavoriteCollections() };
-			}
-			if (action === 'delete') {
-				player.deleteFavoriteCollection(args?.collectionId);
-				return { ok: true, deleted: String(args?.collectionId), collections: player.listFavoriteCollections() };
-			}
-			if (action === 'set-memberships') {
-				const songId = Number(args?.songId);
-				if (!player.isFavorite(songId)) {
-					const current = player.current();
-					if (!current || Number(current.id) !== songId) throw new Error('只能整理已收藏歌曲或当前播放歌曲');
-					player.toggleFavorite();
-					feedback('favorite', current);
-				}
-				const collectionIds = player.setFavoriteMemberships(songId, args?.collectionIds);
-				return { ok: true, songId, collectionIds, collections: player.listFavoriteCollections() };
-			}
-			if (action === 'play') {
-				const result = player.playFavoriteCollection(String(args?.collectionId || 'all'));
-				if (!result.song) return { ok: false, guidance: '这个收藏集还是空的。' };
-				const hit = await urlFor(result.song);
-				if (!hit) return { ok: false, guidance: '收藏集第一首暂时没有可用播放地址。' };
-				player.state.currentUrl = hit.url;
-				player.state.playing = true;
-				return { ok: true, collection: result.collection, added: result.count, queueLength: player.state.queue.length, playedName: result.song.name };
-			}
-			throw new Error('action 需为 list / create / rename / delete / set-memberships / play');
 		},
 
 		/** alger_control：播放控制（内置状态机） */
@@ -1369,18 +1254,6 @@ function registerRoutes(webServer, actions) {
 		},
 		{
 			kind: 'exact',
-			path: '/dsh-alger/favorites',
-			handler: async (req, res) => {
-				try {
-					const body = JSON.parse((await readBody(req)) || '{}');
-					json(res, await actions.favorites(body));
-				} catch (error) {
-					json(res, { ok: false, error: String((error && error.message) || error) });
-				}
-			}
-		},
-		{
-			kind: 'exact',
 			path: '/dsh-alger/search',
 			handler: async (req, res) => {
 				try {
@@ -1543,19 +1416,6 @@ export function apply(ctx, config) {
 				const url = await client.songUrl(id, 'higher');
 				return url ? { url, sourceKey: 'netease', confidence: 1, expiresAt: Date.now() + 4 * 60 * 1000 } : null;
 			},
-			cross: async (track, options) => {
-				const requested = options?.requested;
-				const title = requested?.title ?? track.title;
-				const artist = requested?.artists?.[0] ?? track.artists?.[0] ?? '';
-				const hit = await matchSourceByKeyword(title, artist, null, options?.durationMs ?? 0);
-				return hit ? {
-					url: hit.url,
-					sourceKey: hit.source || 'cross-source',
-					confidence: 0.95,
-					matchedIdentity: requested ?? track,
-					expiresAt: Date.now() + 4 * 60 * 1000
-				} : null;
-			}
 		});
 	} catch (error) {
 		console.warn('[dsh-moony-singer] 音源解析器初始化失败: ' + ((error && error.message) || String(error)));

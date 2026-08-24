@@ -44,21 +44,9 @@ test('recommend route invokes the local coordinator action directly', async () =
 	assert.equal(res.body.requestId, 'button-1');
 });
 
-test('favorites route forwards collection organization requests', async () => {
-	const routes = [];
-	registerRoutesForTest({ register: (route) => routes.push(route) }, {
-		favorites: async (input) => ({ ok: true, action: input.action, name: input.name })
-	});
-	const route = routes.find((item) => item.path === '/dsh-alger/favorites');
-	assert.ok(route, 'favorites route must be registered');
-	const res = response();
-	await route.handler(request({ action: 'create', name: '工作' }), res);
-	assert.deepEqual(res.body, { ok: true, action: 'create', name: '工作' });
-});
-
-test('real actions organize collections and resolve playback after removing the current song', async () => {
+test('real actions resolve playback after removing the current song', async () => {
 	assert.equal(typeof plugin.buildActionsForTest, 'function', 'real action factory must be testable');
-	const player = createPlayer({ file: null, createCollectionId: () => 'focus' });
+	const player = createPlayer({ file: null });
 	player.replaceAndPlay([
 		{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] },
 		{ id: 2, name: '夜曲', ar: [{ name: '周杰伦' }] }
@@ -77,11 +65,6 @@ test('real actions organize collections and resolve playback after removing the 
 		{ recordPlayback: async () => {} }
 	);
 
-	assert.equal((await actions.favorites({ action: 'create', name: '工作' })).collection.id, 'focus');
-	await actions.favorites({ action: 'set-memberships', songId: 1, collectionIds: ['focus'] });
-	const listed = await actions.favorites({ action: 'list', collectionId: 'focus' });
-	assert.deepEqual(listed.songs.map((item) => item.id), [1]);
-
 	const removed = await actions.queue({ action: 'remove', index: 0 });
 	assert.equal(removed.currentChanged, true);
 	assert.equal(player.current().id, 2);
@@ -89,7 +72,7 @@ test('real actions organize collections and resolve playback after removing the 
 	assert.equal((await actions.queue({ action: 'undo-remove', token: removed.token })).restored.id, 1);
 });
 
-test('cross-source search results remain playable when added from the client queue', async () => {
+test('search does not inject an unverified cross-source recording', async () => {
 	const player = createPlayer({ file: null });
 	const cover = { id: 77, name: '晴天', ar: [{ name: 'A-Lin' }], al: { name: '翻唱' }, dt: 240000 };
 	const client = {
@@ -97,26 +80,23 @@ test('cross-source search results remain playable when added from the client que
 		search: async () => ({ songs: [cover] }),
 		songUrl: async () => null
 	};
-	const matchSourceByKeyword = async (name, artist) => ({
+	let matchCalls = 0;
+	const matchSourceByKeyword = async (name, artist) => {
+		matchCalls += 1;
+		return {
 		url: 'https://audio.test/jay-qingtian.mp3', source: 'migu', title: name || '晴天', artist
-	});
+		};
+	};
 	const actions = plugin.buildActionsForTest(
 		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
 		client, {}, player, {}, { recordPlayback: async () => {} }, { matchSourceByKeyword }
 	);
 
 	const searched = await actions.search({ keywords: '周杰伦 晴天', type: 1 });
-	assert.equal(searched.items[0].crossSource, true);
-	assert.equal(searched.items[0].playKeyword, '周杰伦 晴天');
-
-	const added = await actions.queue({ action: 'add', keyword: searched.items[0].playKeyword });
-	assert.equal(added.ok, true);
-	assert.equal(player.state.queue[0].name, '晴天');
-	assert.equal(player.state.queue[0].ar[0].name, '周杰伦');
-	assert.equal(player.state.queue[0].resolvedUrl, 'https://audio.test/jay-qingtian.mp3');
-	player.jump(0);
-	assert.equal((await actions.queue({ action: 'jump', index: 0 })).ok, true);
-	assert.equal(player.state.currentUrl, 'https://audio.test/jay-qingtian.mp3');
+	assert.equal(matchCalls, 0);
+	assert.equal(searched.items.some((item) => item.crossSource), false);
+	assert.deepEqual(searched.items, []);
+	assert.match(searched.guidance, /没有找到.*歌手和歌名.*完全匹配/);
 });
 
 test('tool copy preserves natural dialogue and only recommends on an explicit request', () => {
