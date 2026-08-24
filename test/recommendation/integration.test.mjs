@@ -62,7 +62,7 @@ test('recommend action consumes 30 cached tracks without invoking click-time gen
 	};
 	const actions = plugin.buildActionsForTest(
 		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
-		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} },
+		{ musicApiUp: async () => true, songUrl: async (id) => `https://audio.test/${id}.mp3` }, {}, player, {}, { recordPlayback: async () => {} },
 		{
 			coordinator: { recommend: async () => { coordinatorCalls += 1; }, feedback: async () => true },
 			pool,
@@ -77,6 +77,11 @@ test('recommend action consumes 30 cached tracks without invoking click-time gen
 	assert.deepEqual(scheduled, ['low-watermark']);
 	assert.deepEqual(player.state.queue.slice(1, 31).map((item) => item.name), recommended.map((item) => item.title));
 	assert.equal(player.state.queue.at(-1).name, '手动');
+	assert.equal(player.current().name, '推荐1');
+	assert.equal(player.state.index, 1);
+	assert.equal(player.state.playing, true);
+	assert.equal(player.state.currentUrl, 'https://audio.test/100.mp3');
+	assert.equal(result.insertMode, 'after-current-and-play');
 });
 
 test('status exposes recommendation pool readiness without starting generation', async () => {
@@ -236,15 +241,17 @@ test('long-term preference writes require an explicit valid value', async () => 
 	});
 });
 
-test('client recommendation button sends request ids and ignores stale responses', async () => {
+test('client recommendation opens the queue, closes competing panels, and keeps a stable label', async () => {
 	const source = await readFile(join(root, 'client.js'), 'utf8');
-	assert.match(source, /recommendRequestRef/);
-	assert.match(source, /requestId:\s*requestId/);
-	assert.match(source, /recommendRequestRef\.current\s*!==\s*requestId/);
-	assert.match(source, /state\.recommendation\.ready/);
-	assert.match(source, /准备中/);
-	assert.match(source, /已推荐.*30 首/);
-	assert.doesNotMatch(source, /成功时结果由宠物气泡播报/);
+	const handler = source.slice(source.indexOf('var onRecommend = function () {'), source.indexOf('var loadFavorites = function () {'));
+	assert.match(handler, /setFavoritesOpen\(false\)/);
+	assert.match(handler, /setQueueOpen\(true\)/);
+	assert.match(handler, /setResults\(null\)/);
+	assert.match(handler, /setSearched\(false\)/);
+	assert.match(handler, /requestId:\s*requestId/);
+	assert.match(handler, /recommendRequestRef\.current\s*!==\s*requestId/);
+	assert.doesNotMatch(handler, /setRecommendLabel/);
+	assert.match(source, /onClick:\s*onRecommend\s*\n\s*},\s*"推荐"\)/);
 });
 
 test('profile data follows DSH_HOME instead of leaking across isolated profiles', () => {

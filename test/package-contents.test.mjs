@@ -52,7 +52,7 @@ test('recommendation docs explain both mechanisms and local privacy controls', (
 	const readme = readFileSync(join(root, 'README.md'), 'utf8');
 	for (const phrase of [
 		'快速推荐', '对话情绪价值', '60 首', '每次取出 30 首', '120 首',
-		'准备中', 'localMusicPaths', 'recommendationLearning',
+		'localMusicPaths', 'recommendationLearning',
 		'moony-singer-recommendation-pool.json', '不读取 DSH 对话'
 	]) {
 		assert.ok(readme.includes(phrase), `README must document: ${phrase}`);

@@ -18,6 +18,20 @@ test('recommendations insert after current without replacing manual songs', () =
 	assert.deepEqual(player.state.queue.map((item) => item.moonyOrigin), ['manual', 'recommendation', 'recommendation', 'manual']);
 });
 
+test('button recommendation starts its first song while preserving manual queue entries', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '当前'), song(2, '手动加入')]);
+	player.insertRecommendationAfterCurrent(
+		[song(3, '推荐一'), song(4, '推荐二')],
+		'button-recommendation',
+		{ playFirst: true }
+	);
+	assert.deepEqual(player.state.queue.map((item) => item.name), ['当前', '推荐一', '推荐二', '手动加入']);
+	assert.equal(player.current().name, '推荐一');
+	assert.equal(player.state.index, 1);
+	assert.equal(player.state.playing, true);
+});
+
 test('same-session replan replaces only its unplayed recommendation entries', () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([song(1, '当前'), song(2, '手动加入')]);

@@ -1067,7 +1067,6 @@ window.__ModuleLoader__.load({
 			var [notice, setNotice] = React.useState(null); // {kind:'ok'|'err'|'', text}
 			var [busy, setBusy] = React.useState(false);
 			var [recommendBusy, setRecommendBusy] = React.useState(false);
-			var [recommendLabel, setRecommendLabel] = React.useState(null);
 			var recommendRequestRef = React.useRef(0);
 			var [lrc, setLrc] = React.useState(null); // [{t,text}] 当前歌歌词
 			var [lyricsOpen, setLyricsOpen] = React.useState(false); // 展开视图歌词面板
@@ -1433,15 +1432,16 @@ window.__ModuleLoader__.load({
 				if (!state.recommendation || !state.recommendation.ready) { flash("", "推荐正在准备中"); return; }
 				var requestId = "recommend-" + Date.now() + "-" + (recommendRequestRef.current + 1);
 				recommendRequestRef.current = requestId;
+				setFavoritesOpen(false);
+				setQueueOpen(true);
+				setResults(null);
+				setSearched(false);
+				setSelectedIdx(null);
 				setRecommendBusy(true);
 				post("/dsh-alger/recommend", { requestId: requestId }).then(function (r) {
 					if (recommendRequestRef.current !== requestId) return;
 					setRecommendBusy(false);
 					if (r && !r.ok) flash(r.preparing ? "" : "err", (r && r.guidance) || (r && r.error) || "推荐失败");
-					else {
-						setRecommendLabel("已推荐 30 首");
-						setTimeout(function () { setRecommendLabel(null); }, 1800);
-					}
 					setTimeout(refresh, 120);
 				}).catch(function () {
 					if (recommendRequestRef.current !== requestId) return;
@@ -1904,10 +1904,10 @@ window.__ModuleLoader__.load({
 							}, "收藏"),
 							h("button", {
 								className: "dsa-btn dsa-mode",
-								title: state && state.recommendation && state.recommendation.ready ? "立即推荐 30 首" : "后台正在准备推荐",
+								title: state && state.recommendation && state.recommendation.ready ? "立即推荐 30 首并播放" : "后台正在准备推荐",
 								disabled: !canControl || busy || recommendBusy || !(state && state.recommendation && state.recommendation.ready),
 								onClick: onRecommend
-							}, recommendBusy ? "推荐中" : (recommendLabel || (state && state.recommendation && state.recommendation.ready ? "推荐" : "准备中"))),
+							}, "推荐"),
 														h("button", { className: "dsa-btn", title: "上一首", disabled: !canControl, onClick: function () { runCommand("prev"); } }, ICONS.prev),
 							h("button", {
 								className: "dsa-btn dsa-btn-primary",

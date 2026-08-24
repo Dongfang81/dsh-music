@@ -283,17 +283,19 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				return { ok: false, preparing: true, count: 0, remaining: consumed.remaining, guidance: '推荐正在准备中，请稍后再试。' };
 			}
 			try {
-				player.insertRecommendationAfterCurrent(consumed.tracks, 'button-recommendation');
+				player.insertRecommendationAfterCurrent(consumed.tracks, 'button-recommendation', { playFirst: true });
+				const hit = await urlFor(player.current());
+				player.state.currentUrl = hit ? hit.url : null;
+				if (!hit) player.state.playing = false;
 				await pool.commit(consumed.transaction);
 			} catch (error) {
 				await pool.restore(consumed.transaction).catch(() => {});
 				throw error;
 			}
 			if (consumed.remaining <= 30) scheduler?.schedule('low-watermark');
-			shared.setNotice('♫ 已为你接上 30 首，当前这首继续播');
 			return {
 				ok: true,
-				insertMode: 'after-current',
+				insertMode: 'after-current-and-play',
 				count: consumed.tracks.length,
 				tracks: consumed.tracks,
 				remaining: consumed.remaining
