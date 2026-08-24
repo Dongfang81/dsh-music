@@ -245,6 +245,109 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
+		function createLongPressHandlers(options) {
+			var input = options || {};
+			var timerRef = input.timerRef || { current: null };
+			var triggeredRef = input.triggeredRef || { current: false };
+			var setTimer = input.setTimer || setTimeout;
+			var clearTimer = input.clearTimer || clearTimeout;
+			var clear = function () {
+				if (timerRef.current !== null) clearTimer(timerRef.current);
+				timerRef.current = null;
+			};
+			return {
+				onPointerDown: function () {
+					triggeredRef.current = false;
+					clear();
+					timerRef.current = setTimer(function () {
+						timerRef.current = null;
+						triggeredRef.current = true;
+						if (typeof input.onLongPress === "function") input.onLongPress();
+					}, input.delay || 550);
+				},
+				onPointerUp: clear,
+				onPointerLeave: clear,
+				onPointerCancel: clear,
+				onClick: function (event) {
+					if (triggeredRef.current) {
+						triggeredRef.current = false;
+						if (event && typeof event.preventDefault === "function") event.preventDefault();
+						return;
+					}
+					if (typeof input.onClick === "function") input.onClick(event);
+				}
+			};
+		}
+
+		function FavoriteMembershipPicker(props) {
+			var song = props && props.song;
+			var collections = Array.isArray(props && props.collections) ? props.collections.filter(function (item) { return item && item.id !== "all"; }) : [];
+			var selected = Object.create(null);
+			collections.forEach(function (item) { selected[item.id] = Array.isArray(item.songIds) && song && item.songIds.some(function (id) { return String(id) === String(song.id); }); });
+			return h("div", { className: "dsa-fav-picker", role: "dialog", "aria-label": "收藏到" }, [
+				h("div", { key: "title", className: "dsa-fav-panel-title" }, "收藏到…"),
+				collections.length ? collections.map(function (item) {
+					return h("label", { key: item.id, className: "dsa-fav-check" }, [
+						h("input", { type: "checkbox", value: item.id, defaultChecked: selected[item.id], onChange: function (event) { selected[item.id] = Boolean(event.target.checked); } }),
+						h("span", null, item.name)
+					]);
+				}) : h("div", { key: "empty", className: "dsa-fav-empty" }, "还没有自定义目录，可先新建一个。"),
+				h("div", { key: "actions", className: "dsa-fav-panel-actions" }, [
+					h("button", { type: "button", onClick: function () { if (typeof props.onClose === "function") props.onClose(); } }, "取消"),
+					h("button", { type: "button", className: "primary", onClick: function () { if (typeof props.onSave === "function") props.onSave(Object.keys(selected).filter(function (id) { return selected[id]; })); } }, "保存")
+				])
+			]);
+		}
+
+		function FavoriteCollectionPanel(props) {
+			var collections = Array.isArray(props && props.collections) ? props.collections : [];
+			var songs = Array.isArray(props && props.songs) ? props.songs : [];
+			var activeId = props && props.activeId || "all";
+			var active = collections.find(function (item) { return item.id === activeId; }) || collections[0] || { id: "all", name: "全部收藏", system: true };
+			return h("div", { className: "dsa-fav-panel", role: "dialog", "aria-label": "收藏列表" }, [
+				h("div", { key: "head", className: "dsa-fav-panel-head" }, [
+					h("strong", null, "收藏列表"),
+					h("button", { type: "button", className: "dsa-fav-close", title: "关闭", onClick: props && props.onClose }, "✕")
+				]),
+				h("div", { key: "tabs", className: "dsa-fav-tabs" }, collections.map(function (item) {
+					return h("button", { key: item.id, type: "button", className: item.id === active.id ? "active" : "", onClick: function () { if (typeof props.onSelect === "function") props.onSelect(item.id); } }, item.name + " " + (item.count || 0));
+				})),
+				h("div", { key: "tools", className: "dsa-fav-tools" }, [
+					h("button", { type: "button", disabled: songs.length === 0, onClick: function () { if (typeof props.onPlay === "function") props.onPlay(active.id); } }, "播放此目录"),
+					active.id !== "all" ? h("button", { type: "button", "data-collection-rename": active.id, onClick: function () { if (typeof props.onRename === "function") props.onRename(active); } }, "重命名") : null,
+					active.id !== "all" ? h("button", { type: "button", "data-collection-delete": active.id, onClick: function () { if (typeof props.onDelete === "function") props.onDelete(active); } }, "删除目录") : null,
+					h("button", { type: "button", onClick: function () { if (typeof props.onCreate === "function") props.onCreate(); } }, "＋ 新建")
+				]),
+				h("div", { key: "songs", className: "dsa-fav-songs" }, songs.length ? songs.map(function (song) {
+					return h("div", { key: song.id, className: "dsa-fav-song" }, [
+						h("span", { className: "t", title: song.name }, song.name),
+						h("span", { className: "s", title: song.artists || "" }, song.artists || ""),
+						h("button", { type: "button", onClick: function () { if (typeof props.onOrganize === "function") props.onOrganize(song); } }, "收藏到…")
+					]);
+				}) : h("div", { className: "dsa-fav-empty" }, "这个目录还没有歌曲"))
+			]);
+		}
+
+		function QueueSongRow(props) {
+			var item = props.item || {};
+			var index = Number(props.index);
+			return h("div", {
+				className: "dsa-qitem" + (props.current ? " cur" : "") + (props.selected && !props.current ? " sel" : ""),
+				title: "单击选中，双击播放",
+				onClick: function () { if (typeof props.onSelect === "function") props.onSelect(index); },
+				onDoubleClick: function () { if (typeof props.onJump === "function") props.onJump(index); }
+			}, [
+				h("span", { key: "number", className: "n" }, (index + 1) + "."),
+				h("span", { key: "title", className: "t" }, item.name),
+				h("span", { key: "artist", className: "s" }, item.artists || ""),
+				h("button", {
+					key: "remove", type: "button", className: "dsa-qremove", "aria-label": "从播放列表移除", title: "从播放列表移除",
+					onClick: function (event) { event.stopPropagation(); if (typeof props.onRemove === "function") props.onRemove(index); },
+					onDoubleClick: function (event) { event.stopPropagation(); }
+				}, "×")
+			]);
+		}
+
 		/* ---------- 微信分享面板（朋友无需安装插件） ----------
 		 * 网易云公开链接 + 剪贴板复制 + 二维码（二维码走公共服务，失败自动降级隐藏，
 		 * 分享核心链路始终可用：复制链接 → 微信粘贴 → 自动渲染歌曲卡片）。
@@ -341,6 +444,7 @@ window.__ModuleLoader__.load({
 		var command = function (action) { return post("/dsh-alger/command", { action: action }); };
 		var searchMusic = function (keywords, type) { return post("/dsh-alger/search", { keywords: keywords, type: type || 1, limit: 30 }); };
 		var queueApi = function (payload) { return post("/dsh-alger/queue", payload); };
+		var favoritesApi = function (payload) { return post("/dsh-alger/favorites", payload); };
 		var setupApp = function (action) { return post("/dsh-alger/setup", { action: action }); };
 		var getLyric = function (id) { return post("/dsh-alger/lyric", { id: id }); };
 		var getArtist = function (id) { return post("/dsh-alger/artist", { id: id }); };
@@ -732,6 +836,13 @@ window.__ModuleLoader__.load({
 			".dsa-notice{margin-top:7px;padding:5px 9px;border-radius:8px;font-size:11px;line-height:1.45;background:rgba(245,158,11,0.16);border:1px solid rgba(245,158,11,0.35);color:#fcd34d}",
 			".dsa-notice.ok{background:rgba(52,211,153,0.14);border-color:rgba(52,211,153,0.35);color:#6ee7b7}",
 			".dsa-notice.err{background:rgba(239,68,68,0.14);border-color:rgba(239,68,68,0.35);color:#fca5a5}",
+			".dsa-notice-action{margin-left:8px;border:0;background:transparent;color:inherit;font:inherit;font-weight:700;text-decoration:underline;cursor:pointer}",
+			".dsa-fav-panel,.dsa-fav-picker{margin-top:8px;padding:8px;border:1px solid rgba(255,255,255,.16);border-radius:11px;background:rgba(10,12,20,.86);box-shadow:0 8px 24px rgba(0,0,0,.28)}",
+			".dsa-fav-panel-head{display:flex;align-items:center;justify-content:space-between;font-size:12px}.dsa-fav-close{border:0;background:transparent;color:rgba(255,255,255,.55);cursor:pointer}",
+			".dsa-fav-tabs{display:flex;gap:4px;margin-top:7px;overflow-x:auto;padding-bottom:2px}.dsa-fav-tabs button,.dsa-fav-tools button,.dsa-fav-panel-actions button{flex:none;border:1px solid rgba(255,255,255,.16);border-radius:7px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.75);font-size:10px;padding:3px 7px;cursor:pointer}.dsa-fav-tabs button.active{border-color:#f87171;color:#fca5a5;background:rgba(239,68,68,.13)}",
+			".dsa-fav-tools{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}.dsa-fav-tools button:disabled{opacity:.35;cursor:not-allowed}",
+			".dsa-fav-songs{max-height:150px;overflow-y:auto;margin-top:6px}.dsa-fav-song{display:flex;align-items:center;gap:5px;padding:4px 3px;border-top:1px solid rgba(255,255,255,.06);font-size:10.5px}.dsa-fav-song .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-fav-song .s{max-width:70px;color:rgba(255,255,255,.48);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-fav-song button{border:0;background:transparent;color:#fca5a5;font-size:9.5px;cursor:pointer}",
+			".dsa-fav-panel-title{font-size:12px;font-weight:700;margin-bottom:6px}.dsa-fav-check{display:flex;align-items:center;gap:7px;padding:4px 2px;font-size:11px;cursor:pointer}.dsa-fav-check input{accent-color:#ef4444}.dsa-fav-empty{padding:10px 4px;text-align:center;color:rgba(255,255,255,.45);font-size:10px}.dsa-fav-panel-actions{display:flex;justify-content:flex-end;gap:5px;margin-top:7px}.dsa-fav-panel-actions button.primary{background:#ef4444;border-color:#ef4444;color:#fff}",
 			".dsa-ready{display:flex;align-items:center;gap:8px;margin-top:8px;padding:6px 9px;border-radius:9px;background:rgba(255,255,255,0.06);font-size:11px;color:rgba(255,255,255,0.8)}",
 			".dsa-ready .dot{width:8px;height:8px;border-radius:50%;flex:none}",
 			".dsa-ready .dot.ok{background:#34d399;box-shadow:0 0 6px rgba(52,211,153,0.8)}",
@@ -779,6 +890,7 @@ window.__ModuleLoader__.load({
 			".dsa-qitem .n{flex:none;width:16px;text-align:right;color:rgba(255,255,255,0.4);font-size:10px}",
 			".dsa-qitem .t{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
 			".dsa-qitem .s{font-size:10px;color:rgba(255,255,255,0.5);max-width:80px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+			".dsa-qremove{flex:none;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.55);font-size:15px;line-height:16px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .14s,background .14s}.dsa-qitem:hover .dsa-qremove,.dsa-qremove:focus-visible{opacity:1;pointer-events:auto}.dsa-qremove:hover{background:rgba(239,68,68,.2);color:#fca5a5}",
 			".dsa-addall{margin-top:6px;width:100%;border:1px dashed rgba(255,255,255,0.25);background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.85);border-radius:8px;font-size:11px;padding:4px 0;cursor:pointer}",
 			".dsa-addall:hover{background:rgba(255,255,255,0.12)}",
 			".dsa-addall:disabled{opacity:0.5;cursor:not-allowed}",
@@ -986,6 +1098,12 @@ window.__ModuleLoader__.load({
 			var [queueOpen, setQueueOpen] = React.useState(false);
 			var [selectedIdx, setSelectedIdx] = React.useState(null); // 播放列表"单击选中"的行
 			var [favOptimistic, setFavOptimistic] = React.useState(null); // 收藏乐观状态（null=跟随真实状态）
+			var [favoritesOpen, setFavoritesOpen] = React.useState(false);
+			var [favoriteData, setFavoriteData] = React.useState(null);
+			var [activeFavoriteId, setActiveFavoriteId] = React.useState("all");
+			var [membershipSong, setMembershipSong] = React.useState(null);
+			var heartTimerRef = React.useRef(null);
+			var heartTriggeredRef = React.useRef(false);
 			// 关闭/激活与侧边栏开关按钮共享（pub/sub）
 			var [hidden, setHidden] = React.useState(petVis.hidden);
 			React.useEffect(function () { return onPetHidden(setHidden); }, []);
@@ -1368,20 +1486,78 @@ window.__ModuleLoader__.load({
 				});
 			};
 
-			// 播放收藏列表：整单替换队列播放，并展开播放列表展示
-			var onPlayFavorites = function () {
-				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
+			var loadFavoriteCollection = function (collectionId) {
+				var id = collectionId || "all";
+				setActiveFavoriteId(id);
+				return favoritesApi({ action: "list", collectionId: id }).then(function (r) {
+					if (!r || r.ok === false) throw new Error((r && r.error) || "读取收藏失败");
+					setFavoriteData(r);
+					return r;
+				});
+			};
+			var openFavorites = function () {
+				setFavoritesOpen(true);
+				setMembershipSong(null);
+				loadFavoriteCollection(activeFavoriteId).catch(function (error) { flash("err", error.message || "读取收藏失败"); });
+			};
+			var openMemberships = function (song) {
+				if (!song) return;
+				favoritesApi({ action: "list", collectionId: activeFavoriteId }).then(function (r) {
+					if (!r || r.ok === false) throw new Error((r && r.error) || "读取收藏失败");
+					setFavoriteData(r);
+					setMembershipSong(song);
+				}).catch(function (error) { flash("err", error.message || "读取收藏失败"); });
+			};
+			var saveMemberships = function (collectionIds) {
+				if (!membershipSong) return;
+				favoritesApi({ action: "set-memberships", songId: membershipSong.id, collectionIds: collectionIds }).then(function (r) {
+					if (!r || r.ok === false) throw new Error((r && r.error) || "整理收藏失败");
+					setMembershipSong(null);
+					setFavOptimistic(true);
+					setTimeout(function () { setFavOptimistic(null); }, 2500);
+					if (favoritesOpen) loadFavoriteCollection(activeFavoriteId);
+					setTimeout(refresh, 300);
+				}).catch(function (error) { flash("err", error.message || "整理收藏失败"); });
+			};
+			var playFavoriteCollection = function (collectionId) {
 				setBusy(true);
-				queueApi({ action: "favorites" }).then(function (r) {
+				favoritesApi({ action: "play", collectionId: collectionId }).then(function (r) {
 					setBusy(false);
-					if (r && r.ok) {
-						setQueueOpen(true); // 自动展开播放列表展示收藏
-						setTimeout(refresh, 600);
-					} else {
-						flash("err", (r && r.guidance) || (r && r.error) || "播放收藏失败");
-					}
+					if (!r || r.ok === false) { flash("err", (r && r.guidance) || (r && r.error) || "播放收藏失败"); return; }
+					setFavoritesOpen(false);
+					setQueueOpen(true);
+					setTimeout(refresh, 500);
 				}).catch(function () { setBusy(false); flash("err", "播放收藏失败"); });
 			};
+			var createFavoriteCollection = function () {
+				var name = typeof window.prompt === "function" ? window.prompt("新收藏目录名称") : "";
+				if (!name || !name.trim()) return;
+				favoritesApi({ action: "create", name: name }).then(function (r) {
+					if (!r || r.ok === false) throw new Error((r && r.error) || "新建失败");
+					return loadFavoriteCollection(r.collection.id);
+				}).catch(function (error) { flash("err", error.message || "新建失败"); });
+			};
+			var renameFavoriteCollection = function (collection) {
+				var name = typeof window.prompt === "function" ? window.prompt("重命名收藏目录", collection.name) : "";
+				if (!name || !name.trim() || name.trim() === collection.name) return;
+				favoritesApi({ action: "rename", collectionId: collection.id, name: name }).then(function (r) {
+					if (!r || r.ok === false) throw new Error((r && r.error) || "重命名失败");
+					return loadFavoriteCollection(collection.id);
+				}).catch(function (error) { flash("err", error.message || "重命名失败"); });
+			};
+			var deleteFavoriteCollection = function (collection) {
+				if (typeof window.confirm === "function" && !window.confirm("删除目录“" + collection.name + "”？歌曲仍保留在全部收藏中。")) return;
+				favoritesApi({ action: "delete", collectionId: collection.id }).then(function (r) {
+					if (!r || r.ok === false) throw new Error((r && r.error) || "删除失败");
+					return loadFavoriteCollection("all");
+				}).catch(function (error) { flash("err", error.message || "删除失败"); });
+			};
+			var heartHandlers = createLongPressHandlers({
+				timerRef: heartTimerRef,
+				triggeredRef: heartTriggeredRef,
+				onLongPress: function () { openMemberships(playing); },
+				onClick: onToggleFavorite
+			});
 
 			var onSearch = function (forcedType) {
 				var q = query.trim();
@@ -1497,6 +1673,24 @@ window.__ModuleLoader__.load({
 					if (!r || !r.ok) flash("err", (r && r.guidance) || (r && r.error) || "清空失败");
 					setTimeout(refresh, 400);
 				}).catch(function () { setBusy(false); flash("err", "清空失败"); });
+			};
+
+			var onQueueRemove = function (index) {
+				queueApi({ action: "remove", index: index }).then(function (r) {
+					if (!r || r.ok === false) { flash("err", (r && r.error) || "移除失败"); return; }
+					setSelectedIdx(null);
+					setNotice({ kind: "", text: "已从播放列表移除“" + ((r.removed && r.removed.name) || "歌曲") + "”", undoToken: r.token });
+					if (noticeTimer.current) clearTimeout(noticeTimer.current);
+					noticeTimer.current = setTimeout(function () { setNotice(null); }, 6000);
+					setTimeout(refresh, 250);
+				}).catch(function () { flash("err", "移除失败"); });
+			};
+			var onQueueUndo = function (token) {
+				queueApi({ action: "undo-remove", token: token }).then(function (r) {
+					if (!r || r.ok === false) { flash("err", (r && r.error) || "撤销失败"); return; }
+					flash("ok", "已恢复到播放列表");
+					setTimeout(refresh, 250);
+				}).catch(function () { flash("err", "撤销已失效"); });
 			};
 
 			var onSearchKey = function (event) {
@@ -1779,9 +1973,9 @@ window.__ModuleLoader__.load({
 						h("div", { className: "dsa-controls" }, [
 							h("button", {
 								className: "dsa-btn dsa-mode" + (state && state.favoriteCount > 0 ? " has-fav" : ""),
-								title: "播放收藏的音乐（" + (state && state.favoriteCount ? state.favoriteCount + " 首" : "暂无收藏") + "）",
+								title: "打开收藏列表（" + (state && state.favoriteCount ? state.favoriteCount + " 首" : "暂无收藏") + "）",
 								disabled: !canControl || busy,
-								onClick: onPlayFavorites
+								onClick: openFavorites
 							}, "收藏"),
 							h("button", { className: "dsa-btn dsa-mode", title: "推荐播放（不知道听什么时用）", disabled: !canControl || busy, onClick: onRecommend }, "推荐"),
 														h("button", { className: "dsa-btn", title: "上一首", disabled: !canControl, onClick: function () { runCommand("prev"); } }, ICONS.prev),
@@ -1794,9 +1988,13 @@ window.__ModuleLoader__.load({
 							h("button", { className: "dsa-btn", title: "下一首", disabled: !canControl, onClick: function () { runCommand("next"); } }, ICONS.next),
 							h("button", {
 								className: "dsa-btn dsa-fav" + ((favOptimistic !== null ? favOptimistic : Boolean(state && state.favorite)) ? " active" : ""),
-								title: "收藏/取消收藏当前歌曲",
+								title: "单击收藏/取消收藏；长按整理到目录",
 								disabled: !canControl || !playing,
-								onClick: onToggleFavorite
+								onPointerDown: heartHandlers.onPointerDown,
+								onPointerUp: heartHandlers.onPointerUp,
+								onPointerLeave: heartHandlers.onPointerLeave,
+								onPointerCancel: heartHandlers.onPointerCancel,
+								onClick: heartHandlers.onClick
 							}, "♥"),
 							h("button", {
 								className: "dsa-btn dsa-mode-icon",
@@ -1931,6 +2129,24 @@ window.__ModuleLoader__.load({
 									})
 								])
 							: null,
+						favoritesOpen && favoriteData && !membershipSong ? h(FavoriteCollectionPanel, {
+							collections: favoriteData.collections,
+							activeId: activeFavoriteId,
+							songs: favoriteData.songs,
+							onClose: function () { setFavoritesOpen(false); setMembershipSong(null); },
+							onSelect: function (id) { loadFavoriteCollection(id).catch(function (error) { flash("err", error.message || "读取收藏失败"); }); },
+							onPlay: playFavoriteCollection,
+							onCreate: createFavoriteCollection,
+							onRename: renameFavoriteCollection,
+							onDelete: deleteFavoriteCollection,
+							onOrganize: openMemberships
+						}) : null,
+						membershipSong && favoriteData ? h(FavoriteMembershipPicker, {
+							song: membershipSong,
+							collections: favoriteData.collections,
+							onSave: saveMemberships,
+							onClose: function () { setMembershipSong(null); }
+						}) : null,
 						// 播放列表
 						state && state.queue && Array.isArray(state.queue.items)
 							? h("div", { className: "dsa-queue" }, [
@@ -1940,22 +2156,17 @@ window.__ModuleLoader__.load({
 										h("span", { className: "fold" }, queueOpen ? "▾" : "▸")
 									]),
 									queueOpen
-										? h("div", { className: "dsa-queue-list" }, [
-												state.queue.items.map(function (item, i) {
-													return h("div", {
-														key: item.id + "-" + i,
-														className: "dsa-qitem" +
-															(i === state.queue.index ? " cur" : "") +
-															(i === selectedIdx && i !== state.queue.index ? " sel" : ""),
-														title: "单击选中，双击播放",
-														onClick: function () { onQueueSelect(i); },
-														onDoubleClick: function () { onQueueJump(i); }
-													}, [
-														h("span", { className: "n" }, (i + 1) + "."),
-														h("span", { className: "t" }, item.name),
-														h("span", { className: "s" }, item.artists || "")
-													]);
-												}),
+									? h("div", { className: "dsa-queue-list" }, [
+											state.queue.items.map(function (item, i) {
+												return h(QueueSongRow, {
+													key: item.id + "-" + i, item: item, index: i,
+													current: i === state.queue.index,
+													selected: i === selectedIdx,
+													onSelect: onQueueSelect,
+													onJump: onQueueJump,
+													onRemove: onQueueRemove
+												});
+											}),
 												h("div", { className: "dsa-qclear-row" }, [
 													h("button", {
 														className: "dsa-qclear",
@@ -1969,7 +2180,10 @@ window.__ModuleLoader__.load({
 							: null,
 						// 通知
 						notice
-							? h("div", { className: "dsa-notice" + (notice.kind ? " " + notice.kind : "") }, notice.text)
+							? h("div", { className: "dsa-notice" + (notice.kind ? " " + notice.kind : "") }, [
+								h("span", { key: "text" }, notice.text),
+								notice.undoToken ? h("button", { key: "undo", type: "button", className: "dsa-notice-action", onClick: function () { onQueueUndo(notice.undoToken); } }, "撤销") : null
+							])
 							: null
 					])
 					]),
@@ -2040,6 +2254,10 @@ window.__ModuleLoader__.load({
 		exports.resolveMoonyState = resolveMoonyState;
 		exports.MoonyPet = MoonyPet;
 		exports.MoonyPicker = MoonyPicker;
+		exports.createLongPressHandlers = createLongPressHandlers;
+		exports.FavoriteCollectionPanel = FavoriteCollectionPanel;
+		exports.FavoriteMembershipPicker = FavoriteMembershipPicker;
+		exports.QueueSongRow = QueueSongRow;
 		return module.exports;
 	}
 });
