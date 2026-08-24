@@ -14,5 +14,3 @@
         localMusicPaths: []
         # 是否根据本地播放反馈更新推荐偏好
         recommendationLearning: true
-        # 点击“推荐”时计划插入的歌曲数
-        recommendationTargetSize: 15

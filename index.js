@@ -58,6 +58,7 @@ const DEFAULTS = {
 	timeoutMs: 20000,
 	localMusicPaths: [],
 	recommendationLearning: true,
+	// 旧版兼容字段：后台池上线后不再向用户展示，旧配置仍可安全读取。
 	recommendationTargetSize: 15
 };
 

@@ -72,7 +72,11 @@
 
 ### 一键「快速推荐」
 
-播放器里的推荐按钮走纯本地确定性流程，不调用 LLM：综合约 **50% 个人口味、30% 当前场景、20% 新鲜探索**，先验证至少 5 首确实可播放的歌，再接到当前歌曲后面。它不会打断正在播放的歌，也不会用随机歌单覆盖你的手动队列；某个音源失败时只缩短结果。
+播放器里的推荐按钮不在点击时临时计算：Moony 会在后台维护一个 **60 首**的可播放推荐池，点击后立即从池中**每次取出 30 首**，接到当前歌曲后面。它不会打断正在播放的歌，也不会覆盖你手动加入的队列；再次点击时，只替换上一批尚未播放的按钮推荐。
+
+后台排序仍会综合个人口味、当前歌曲与队列、收藏和明确搜索播放等因素，但不再按早晚或工作日臆测心情。收藏/取消收藏、明确搜索并播放、记住或清除长期偏好后会触发后台更新；单纯播放不足 20 秒或听完 80% 以上不会启动额外任务。最近推荐过的 **120 首**只会被柔和降权，并非永久排除，因此既减少短期重复，也不会让喜欢的歌永远消失。
+
+首次安装或推荐池尚未准备好时，按钮会显示「**准备中**」且暂不可点；生成失败会保留上一份完整池，不影响 DSH 和正常播放。推荐池只保存歌曲身份和排序信息，不持久化临时播放链接。
 
 ### DSH「对话情绪价值」
 
@@ -134,17 +138,16 @@ dsh plugin --profile web add github:Dongfang81/dsh-music
     timeoutMs: 20000
     localMusicPaths: []             # 可选；只接受用户明确授权的绝对路径
     recommendationLearning: true    # false = 停止记录新的推荐反馈
-    recommendationTargetSize: 15    # 一键推荐的目标歌曲数（不足时诚实返回短队列）
 ```
 
 `localMusicPaths` 默认是空数组，因此插件不会主动扫描任何个人目录。配置后只索引 `.mp3/.flac/.m4a/.aac/.ogg/.wav` 的标签信息；真实路径必须仍位于授权根目录内，指向目录外的符号链接会被拒绝。
 
 ## 🔐 本地数据与隐私边界
 
-- 播放事实保存在 `~/.dsh/moony-singer-habits.json`；推荐偏好保存在 `~/.dsh/moony-singer-recommendation.json`。
+- 播放事实保存在 `~/.dsh/moony-singer-habits.json`；推荐偏好保存在 `~/.dsh/moony-singer-recommendation.json`；后台候选池保存在 `~/.dsh/moony-singer-recommendation-pool.json`。
 - 只记录播放、收藏、完整听完、很快跳过和你明确要求长期记住的音乐偏好；不读取 DSH 对话，不保存聊天内容，也不跨设备上传。
 - `recommendationLearning: false` 会停止新增推荐学习；现有数据仍留在本机，方便恢复。
-- 对话中用 `alger_preference action=summary` 可检查长期偏好，用 `alger_preference action=clear` 清空推荐档案；`alger_habits action=clear` 清空旧听歌事实。也可以在 DSH 停止后直接删除上述两个本地 JSON 文件。
+- 对话中用 `alger_preference action=summary` 可检查长期偏好，用 `alger_preference action=clear` 清空推荐档案；`alger_habits action=clear` 清空旧听歌事实。也可以在 DSH 停止后直接删除上述三个本地 JSON 文件；推荐池会在下次启动后重新生成。
 - 本地音乐只在 `localMusicPaths` 明确授权范围内读取。移除路径并重启后不再扫描；索引只在内存中存在，不复制音频文件。
 
 ## ❓ 常见问题
