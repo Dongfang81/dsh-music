@@ -59,6 +59,23 @@ test('captures detached generation failures without rejecting or blocking the ne
 	assert.equal(scheduler.status().lastError, null);
 });
 
+test('retries a failed background refill until it recovers', async () => {
+	let attempts = 0;
+	const scheduler = createRecommendationScheduler({
+		debounceMs: 0,
+		retryDelayMs: 1,
+		generate: async () => {
+			attempts += 1;
+			if (attempts === 1) throw new Error('short-generation');
+		}
+	});
+
+	scheduler.startNow('low-watermark');
+	await scheduler.whenIdle();
+	assert.equal(attempts, 2);
+	assert.equal(scheduler.status().lastError, null);
+});
+
 test('dispose cancels queued work and rejects new scheduling', async () => {
 	let calls = 0;
 	const scheduler = createRecommendationScheduler({ debounceMs: 50, generate: async () => { calls += 1; } });

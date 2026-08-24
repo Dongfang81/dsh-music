@@ -92,6 +92,37 @@ test('tops up an incomplete pool with new verified tracks instead of replacing a
 	assert.deepEqual(state.items.slice(0, 2).map((track) => track.trackKey), tracks(2, 2000).map((track) => track.trackKey));
 });
 
+test('unplayed button recommendations stay eligible when they will be replaced on the next click', async () => {
+	const dir = await mkdtemp(join(tmpdir(), 'moony-recover-generator-'));
+	const pool = createRecommendationPool({ file: join(dir, 'pool.json') });
+	await pool.replace(tracks(48, 1000), { generationId: 'partial' });
+	const consumed = await pool.consume(30);
+	await pool.commit(consumed.transaction);
+
+	const current = { ...tracks(1, 5000)[0], moonyOrigin: 'recommendation', recommendationSessionId: 'button-recommendation' };
+	const replaceable = tracks(29, 6000).map((track) => ({
+		...track,
+		moonyOrigin: 'recommendation',
+		recommendationSessionId: 'button-recommendation'
+	}));
+	const queue = [current, ...replaceable];
+	const generator = createRecommendationGenerator({
+		pool,
+		player: { current: () => current, state: { queue, index: 0 } },
+		profile: { snapshot: async () => ({ tracks: {}, artists: {}, rules: [], resolverStats: {} }) },
+		collectCandidates: async () => ({ tracks: replaceable, failures: [] }),
+		resolver: { resolve: async (track) => ({ playable: true, url: `https://temporary/${track.trackKey}` }) },
+		targetSize: 60,
+		rng: () => 0.5
+	});
+
+	const result = await generator.generate({ reasons: ['low-watermark'] });
+	const state = await pool.snapshot();
+	assert.equal(result.ok, true);
+	assert.equal(state.ready, true);
+	assert.equal(state.count, 47);
+});
+
 test('returns an honest failure and keeps the pool when candidate collection fails', async () => {
 	const { pool } = await fixture();
 	await pool.replace(tracks(60, 2000), { generationId: 'old' });

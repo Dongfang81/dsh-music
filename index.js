@@ -1517,6 +1517,7 @@ export function apply(ctx, config) {
 			});
 			recommendationScheduler = createRecommendationScheduler({
 				debounceMs: 2000,
+				retryDelayMs: 30000,
 				generate: async (input) => {
 					const result = await recommendationGenerator.generate(input);
 					if (!result.ok) throw new Error(result.error || result.reason || '推荐池生成失败');
