@@ -17,7 +17,7 @@ test('keeps current song, avoids adjacent artists, and caps each artist at two',
 		ranked('B1', '乙', 97), ranked('C1', '丙', 96), ranked('B2', '乙', 95),
 		ranked('D1', '丁', 94), ranked('E1', '戊', 93)
 	];
-	const plan = planQueue({ ranked: rankedTracks, targetSize: 8, rng: () => 0.5, currentTrack, existingQueue: [currentTrack] });
+	const plan = planQueue({ ranked: rankedTracks, targetSize: 7, rng: () => 0.5, currentTrack, existingQueue: [currentTrack] });
 	assert.equal(plan.insertAfterTrackKey, currentTrack.trackKey);
 	assert.ok(plan.tracks.every((track) => track.trackKey !== currentTrack.trackKey));
 	for (let index = 1; index < plan.tracks.length; index += 1) {
@@ -25,6 +25,25 @@ test('keeps current song, avoids adjacent artists, and caps each artist at two',
 	}
 	const counts = plan.tracks.reduce((all, item) => ({ ...all, [item.artists[0]]: (all[item.artists[0]] || 0) + 1 }), {});
 	assert.ok(Object.values(counts).every((count) => count <= 2));
+});
+
+test('relaxes the artist cap only when needed to fill the requested pool', () => {
+	const plan = planQueue({
+		ranked: [
+			ranked('A1', '甲', 100), ranked('B1', '乙', 99),
+			ranked('A2', '甲', 98), ranked('B2', '乙', 97),
+			ranked('A3', '甲', 96), ranked('B3', '乙', 95)
+		],
+		targetSize: 6,
+		rng: () => 0.5,
+		currentTrack,
+		existingQueue: []
+	});
+
+	assert.equal(plan.tracks.length, 6);
+	for (let index = 1; index < plan.tracks.length; index += 1) {
+		assert.notEqual(plan.tracks[index - 1].artists[0], plan.tracks[index].artists[0]);
+	}
 });
 
 test('puts three high-confidence choices first and returns an honest short queue', () => {

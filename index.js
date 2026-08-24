@@ -1521,8 +1521,8 @@ export function apply(ctx, config) {
 					return result;
 				}
 			});
-			recommendationPool.load().then((state) => {
-				if (state.items.length < 30) recommendationScheduler.schedule('startup');
+			recommendationPool.load().then(() => {
+				if (recommendationPool.needsRefill()) recommendationScheduler.schedule('startup');
 			}).catch((error) => {
 				console.warn('[dsh-moony-singer] 推荐池加载失败: ' + ((error && error.message) || String(error)));
 				recommendationScheduler.schedule('startup-recovery');

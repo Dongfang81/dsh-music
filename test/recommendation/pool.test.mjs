@@ -52,6 +52,15 @@ test('restores a consumed batch when queue insertion fails', async () => {
 	assert.equal(state.pending, null);
 });
 
+test('requests a background top-up whenever the pool is below its 60-track target', async () => {
+	const { pool } = await fixture();
+	await pool.replace(tracks(58), { generationId: 'short-cold-start' });
+	assert.equal((await pool.snapshot()).ready, true);
+	assert.equal(pool.needsRefill(), true);
+	await pool.replace(tracks(60, 100), { generationId: 'complete' });
+	assert.equal(pool.needsRefill(), false);
+});
+
 test('recovers an uncommitted consumption after process restart', async () => {
 	const { file, pool } = await fixture();
 	await pool.replace(tracks(60), { generationId: 'g1' });
