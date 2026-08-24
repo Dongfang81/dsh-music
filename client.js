@@ -254,6 +254,33 @@ window.__ModuleLoader__.load({
 			}, "♥");
 		}
 
+		function FavoriteListPanel(props) {
+			var songs = Array.isArray(props && props.songs) ? props.songs : [];
+			return h("div", { className: "dsa-favorites", role: "region", "aria-label": "我的收藏" }, [
+				h("div", { key: "head", className: "dsa-favorites-head" }, [
+					h("strong", null, "我的收藏"),
+					h("span", { className: "dsa-favorites-count" }, songs.length + " 首"),
+					h("button", {
+						type: "button", className: "dsa-favorites-play", "aria-label": "播放全部收藏", title: "播放全部",
+						disabled: songs.length === 0 || Boolean(props && props.busy),
+						onClick: props && props.onPlayAll
+					}, "▶"),
+					h("button", { type: "button", className: "dsa-favorites-close", "aria-label": "关闭收藏列表", title: "关闭", onClick: props && props.onClose }, "×")
+				]),
+				h("div", { key: "songs", className: "dsa-favorites-songs" }, songs.length ? songs.map(function (song, index) {
+					return h("button", {
+						key: song.id + "-" + index, type: "button", className: "dsa-favorite-row",
+						title: "从这首开始播放", disabled: Boolean(props && props.busy),
+						onClick: function () { if (typeof props.onPlayFrom === "function") props.onPlayFrom(index); }
+					}, [
+						h("span", { className: "n" }, (index + 1) + "."),
+						h("span", { className: "t" }, song.name),
+						h("span", { className: "s" }, song.artists || "")
+					]);
+				}) : h("div", { className: "dsa-favorites-empty" }, props && props.loading ? "正在读取收藏…" : "还没有收藏音乐，播放歌曲时点红心即可收藏。"))
+			]);
+		}
+
 		function QueueSongRow(props) {
 			var item = props.item || {};
 			var index = Number(props.index);
@@ -379,6 +406,7 @@ window.__ModuleLoader__.load({
 		var command = function (action) { return post("/dsh-alger/command", { action: action }); };
 		var searchMusic = function (keywords, type) { return post("/dsh-alger/search", { keywords: keywords, type: type || 1, limit: 30 }); };
 		var queueApi = function (payload) { return post("/dsh-alger/queue", payload); };
+		var favoritesApi = function () { return post("/dsh-alger/favorites", {}); };
 		var setupApp = function (action) { return post("/dsh-alger/setup", { action: action }); };
 		var getLyric = function (id) { return post("/dsh-alger/lyric", { id: id }); };
 		var getArtist = function (id) { return post("/dsh-alger/artist", { id: id }); };
@@ -730,7 +758,7 @@ window.__ModuleLoader__.load({
 			".dsa-btn-primary{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,rgba(255,255,255,0.95),rgba(255,255,255,0.72));color:#11131f;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,0.35)}",
 			".dsa-btn-primary:hover{filter:brightness(1.05)}",
 			".dsa-mode{font-size:10px;min-width:32px;padding:0 3px;color:rgba(255,255,255,0.85)}",
-			".dsa-mode.has-fav{color:#fca5a5}",
+			".dsa-favorites-toggle.active{background:rgba(255,255,255,.13);color:#fff}",
 			".dsa-mode-icon{width:24px;height:24px;color:rgba(255,255,255,0.8)}",
 			".dsa-shape-wrap{position:relative;display:flex;align-items:stretch;border-radius:9px;background:linear-gradient(135deg,#fbbf24,#f97316);box-shadow:0 0 10px rgba(251,146,60,0.55),0 2px 8px rgba(0,0,0,0.3);transition:filter .15s,box-shadow .15s}.dsa-shape-wrap:hover{filter:brightness(1.08);box-shadow:0 0 16px rgba(251,146,60,0.8),0 2px 10px rgba(0,0,0,0.35)}",
 			".dsa-shape{font-size:11px;font-weight:700;width:auto;min-width:42px;padding:0 7px;border-radius:9px 0 0 9px;color:#1c1200}.dsa-shape-arrow{width:22px;border-left:1px solid rgba(89,48,0,.25);border-radius:0 9px 9px 0;color:#1c1200;font-size:10px}.dsa-shape:hover,.dsa-shape-arrow:hover{background:rgba(255,255,255,.2)}",
@@ -767,6 +795,10 @@ window.__ModuleLoader__.load({
 			".dsa-item .t{flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
 			".dsa-item .s{font-size:10px;color:rgba(255,255,255,0.6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px}",
 			".dsa-item .p{font-size:10px;color:rgba(255,255,255,0.45);flex:none}",
+			".dsa-favorites{margin-top:7px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.05);overflow:hidden}",
+			".dsa-favorites-head{height:32px;display:flex;align-items:center;gap:6px;padding:0 7px;border-bottom:1px solid rgba(255,255,255,.08)}.dsa-favorites-head strong{font-size:11px}.dsa-favorites-count{font-size:9.5px;color:rgba(255,255,255,.5)}",
+			".dsa-favorites-play,.dsa-favorites-close{width:22px;height:22px;border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.8);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}.dsa-favorites-play{font-size:9px}.dsa-favorites-play:hover,.dsa-favorites-close:hover{background:rgba(255,255,255,.13);color:#fff}.dsa-favorites-play:disabled{opacity:.3;cursor:not-allowed}.dsa-favorites-close{margin-left:auto;font-size:14px}",
+			".dsa-favorites-songs{max-height:205px;overflow-y:auto;padding:3px;scrollbar-width:thin}.dsa-favorite-row{width:100%;height:29px;border:0;border-radius:7px;background:transparent;color:#fff;display:flex;align-items:center;gap:6px;padding:0 6px;text-align:left;cursor:pointer}.dsa-favorite-row:hover{background:rgba(255,255,255,.1)}.dsa-favorite-row .n{width:20px;flex:none;font-size:9.5px;color:rgba(255,255,255,.38);text-align:right}.dsa-favorite-row .t{flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-row .s{max-width:88px;font-size:9.5px;color:rgba(255,255,255,.52);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorites-empty{padding:18px 10px;text-align:center;font-size:10px;line-height:1.5;color:rgba(255,255,255,.45)}",
 			".dsa-notice{margin-top:7px;padding:5px 9px;border-radius:8px;font-size:11px;line-height:1.45;background:rgba(245,158,11,0.16);border:1px solid rgba(245,158,11,0.35);color:#fcd34d}",
 			".dsa-notice.ok{background:rgba(52,211,153,0.14);border-color:rgba(52,211,153,0.35);color:#6ee7b7}",
 			".dsa-notice.err{background:rgba(239,68,68,0.14);border-color:rgba(239,68,68,0.35);color:#fca5a5}",
@@ -1026,6 +1058,9 @@ window.__ModuleLoader__.load({
 			var [queueOpen, setQueueOpen] = React.useState(false);
 			var [selectedIdx, setSelectedIdx] = React.useState(null); // 播放列表"单击选中"的行
 			var [favOptimistic, setFavOptimistic] = React.useState(null); // 收藏乐观状态（null=跟随真实状态）
+			var [favoritesOpen, setFavoritesOpen] = React.useState(false);
+			var [favoriteSongs, setFavoriteSongs] = React.useState(null);
+			var [favoritesLoading, setFavoritesLoading] = React.useState(false);
 			// 关闭/激活与侧边栏开关按钮共享（pub/sub）
 			var [hidden, setHidden] = React.useState(petVis.hidden);
 			React.useEffect(function () { return onPetHidden(setHidden); }, []);
@@ -1378,6 +1413,7 @@ window.__ModuleLoader__.load({
 				command("toggle-favorite").then(function (r) {
 					if (r && r.ok === false) { setFavOptimistic(null); flash("err", r.error || "收藏失败"); return; }
 					setTimeout(refresh, 300);
+					if (favoritesOpen) setTimeout(loadFavorites, 300);
 				}).catch(function () { setFavOptimistic(null); flash("err", "收藏失败"); });
 			};
 
@@ -1408,14 +1444,33 @@ window.__ModuleLoader__.load({
 				});
 			};
 
-			// 播放收藏列表：整单替换队列播放，并展开播放列表展示
-			var onPlayFavorites = function () {
+			var loadFavorites = function () {
+				setFavoritesLoading(true);
+				return favoritesApi().then(function (r) {
+					setFavoritesLoading(false);
+					if (!r || r.ok === false) throw new Error((r && r.error) || "读取收藏失败");
+					setFavoriteSongs(r.songs || []);
+					return r;
+				}).catch(function (error) {
+					setFavoritesLoading(false);
+					throw error;
+				});
+			};
+			var toggleFavorites = function () {
+				if (favoritesOpen) { setFavoritesOpen(false); return; }
+				setFavoritesOpen(true);
+				setQueueOpen(false);
+				setResults(null);
+				setSearched(false);
+				loadFavorites().catch(function (error) { flash("err", error.message || "读取收藏失败"); });
+			};
+			// 播放全部或从收藏中的指定歌曲开始；收藏面板保持打开。
+			var playFavoritesFrom = function (index) {
 				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
 				setBusy(true);
-				queueApi({ action: "favorites" }).then(function (r) {
+				queueApi({ action: "favorites", favoriteIndex: index || 0 }).then(function (r) {
 					setBusy(false);
 					if (!r || r.ok === false) { flash("err", (r && r.guidance) || (r && r.error) || "播放收藏失败"); return; }
-					setQueueOpen(true);
 					setTimeout(refresh, 500);
 				}).catch(function () { setBusy(false); flash("err", "播放收藏失败"); });
 			};
@@ -1425,6 +1480,7 @@ window.__ModuleLoader__.load({
 				if (!q) return;
 				// 展开搜索时收起播放列表，给搜索结果腾空间（搜索区在播放列表上方）
 				setQueueOpen(false);
+				setFavoritesOpen(false);
 				// 切换 tab 重搜时显式传 type，避免 setTimeout 闭包捕获旧的 searchType 导致搜错类型
 				var t = typeof forcedType === "number" ? forcedType : searchType;
 				setSearched(true);
@@ -1835,10 +1891,10 @@ window.__ModuleLoader__.load({
 						// 传输控制（含收藏）
 						h("div", { className: "dsa-controls" }, [
 							h("button", {
-								className: "dsa-btn dsa-mode" + (state && state.favoriteCount > 0 ? " has-fav" : ""),
-								title: "播放收藏的音乐（" + (state && state.favoriteCount ? state.favoriteCount + " 首" : "暂无收藏") + "）",
+								className: "dsa-btn dsa-mode dsa-favorites-toggle" + (favoritesOpen ? " active" : ""),
+								title: "查看收藏（" + (state && state.favoriteCount ? state.favoriteCount + " 首" : "暂无收藏") + "）",
 								disabled: !canControl || busy,
-								onClick: onPlayFavorites
+								onClick: toggleFavorites
 							}, "收藏"),
 							h("button", { className: "dsa-btn dsa-mode", title: "推荐播放（不知道听什么时用）", disabled: !canControl || busy, onClick: onRecommend }, "推荐"),
 														h("button", { className: "dsa-btn", title: "上一首", disabled: !canControl, onClick: function () { runCommand("prev"); } }, ICONS.prev),
@@ -1925,7 +1981,7 @@ window.__ModuleLoader__.load({
 								value: query,
 								disabled: busy,
 								onChange: function (e) { setQuery(e.target.value); },
-								onFocus: function () { setQueueOpen(false); }, // 聚焦搜索：收起播放列表
+								onFocus: function () { setQueueOpen(false); setFavoritesOpen(false); }, // 聚焦搜索：收起其他列表
 								onKeyDown: onSearchKey
 							}),
 							h("button", {
@@ -1987,8 +2043,16 @@ window.__ModuleLoader__.load({
 									})
 								])
 							: null,
+						favoritesOpen ? h(FavoriteListPanel, {
+							songs: favoriteSongs || [],
+							loading: favoritesLoading,
+							busy: busy,
+							onPlayAll: function () { playFavoritesFrom(0); },
+							onPlayFrom: playFavoritesFrom,
+							onClose: function () { setFavoritesOpen(false); }
+						}) : null,
 						// 播放列表
-						state && state.queue && Array.isArray(state.queue.items)
+						!favoritesOpen && state && state.queue && Array.isArray(state.queue.items)
 							? h("div", { className: "dsa-queue" }, [
 									h("div", { className: "dsa-queue-title", onClick: function () { setQueueOpen(!queueOpen); } }, [
 										h("span", null, "播放列表"),
@@ -2095,6 +2159,7 @@ window.__ModuleLoader__.load({
 		exports.MoonyPet = MoonyPet;
 		exports.MoonyPicker = MoonyPicker;
 		exports.FavoriteHeartButton = FavoriteHeartButton;
+		exports.FavoriteListPanel = FavoriteListPanel;
 		exports.QueueSongRow = QueueSongRow;
 		exports.queuePayloadForSearchItem = queuePayloadForSearchItem;
 		exports.searchFeedbackForResponse = searchFeedbackForResponse;

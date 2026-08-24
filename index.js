@@ -356,6 +356,12 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			return { ok: true, keyword: keywords, type, total: items.length, items, ...(guidance ? { guidance } : {}) };
 		},
 
+		/** 浏览器收藏面板：只暴露一个扁平收藏列表，不承担目录或整理功能。 */
+		async favoritesList() {
+			const songs = player.state.favorites.map(compactSong);
+			return { ok: true, count: songs.length, songs };
+		},
+
 		/** alger_song */
 		async song(args) {
 			const id = Number(args?.id);
@@ -560,7 +566,11 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 
 			// 播放收藏列表：整单替换队列并播放第一首
 			if (action === 'favorites') {
-				const fv = player.playFavorites();
+				const requestedIndex = args?.favoriteIndex === undefined ? 0 : Number(args.favoriteIndex);
+				if (!Number.isInteger(requestedIndex) || requestedIndex < 0 || requestedIndex >= player.state.favorites.length) {
+					if (player.state.favorites.length > 0) throw new Error('favoriteIndex 需要是收藏列表内有效的 0 起整数。');
+				}
+				const fv = player.playFavorites(requestedIndex);
 				if (!fv.song) {
 					return { ok: false, steps: [...steps, '收藏列表为空'], guidance: '先点心形按钮收藏几首歌，再回来点“收藏”播放。' };
 				}
@@ -1247,6 +1257,17 @@ function registerRoutes(webServer, actions) {
 				try {
 					const body = JSON.parse((await readBody(req)) || '{}');
 					json(res, await actions.recommend(body));
+				} catch (error) {
+					json(res, { ok: false, error: String((error && error.message) || error) });
+				}
+			}
+		},
+		{
+			kind: 'exact',
+			path: '/dsh-alger/favorites',
+			handler: async (_req, res) => {
+				try {
+					json(res, await actions.favoritesList());
 				} catch (error) {
 					json(res, { ok: false, error: String((error && error.message) || error) });
 				}

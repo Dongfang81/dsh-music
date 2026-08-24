@@ -138,6 +138,29 @@ test('favorite heart is a one-click toggle with no organization gesture', () => 
 	assert.deepEqual(events, ['favorite']);
 });
 
+test('favorite list keeps the compact play icon directly after the song count', () => {
+	const { FavoriteListPanel } = loadClient();
+	const events = [];
+	const tree = FavoriteListPanel({
+		songs: [
+			{ id: 1, name: '晴天', artists: '周杰伦' },
+			{ id: 2, name: '夜曲', artists: '周杰伦' }
+		],
+		onPlayAll() { events.push('all'); },
+		onPlayFrom(index) { events.push(`from:${index}`); }
+	});
+	const head = findNodes(tree, (node) => node.props?.className === 'dsa-favorites-head')[0];
+	assert.equal(head.props.children[1].props.children, '2 首');
+	const play = head.props.children[2];
+	assert.equal(play.type, 'button');
+	assert.equal(play.props['aria-label'], '播放全部收藏');
+	assert.notEqual(play.props.children, '播放全部');
+	play.props.onClick();
+	const rows = findNodes(tree, (node) => node.props?.className === 'dsa-favorite-row');
+	rows[1].props.onClick();
+	assert.deepEqual(events, ['all', 'from:1']);
+});
+
 test('queue song row exposes one lightweight remove control that does not select the row', () => {
 	const { QueueSongRow } = loadClient();
 	const events = [];

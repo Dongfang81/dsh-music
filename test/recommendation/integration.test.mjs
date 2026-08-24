@@ -44,6 +44,18 @@ test('recommend route invokes the local coordinator action directly', async () =
 	assert.equal(res.body.requestId, 'button-1');
 });
 
+test('favorites route exposes one flat read-only song list', async () => {
+	const routes = [];
+	registerRoutesForTest({ register: (route) => routes.push(route) }, {
+		favoritesList: async () => ({ ok: true, count: 1, songs: [{ id: 1, name: '晴天', artists: '周杰伦' }] })
+	});
+	const route = routes.find((item) => item.path === '/dsh-alger/favorites');
+	assert.ok(route);
+	const res = response();
+	await route.handler(request({}), res);
+	assert.deepEqual(res.body, { ok: true, count: 1, songs: [{ id: 1, name: '晴天', artists: '周杰伦' }] });
+});
+
 test('real actions resolve playback after removing the current song', async () => {
 	assert.equal(typeof plugin.buildActionsForTest, 'function', 'real action factory must be testable');
 	const player = createPlayer({ file: null });
@@ -70,6 +82,27 @@ test('real actions resolve playback after removing the current song', async () =
 	assert.equal(player.current().id, 2);
 	assert.equal(player.state.currentUrl, 'https://audio.test/2.mp3');
 	assert.equal((await actions.queue({ action: 'undo-remove', token: removed.token })).restored.id, 1);
+});
+
+test('favorite rows can start playback at their position without losing the rest of the list', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([
+		{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] },
+		{ id: 2, name: '夜曲', ar: [{ name: '周杰伦' }] }
+	]);
+	player.toggleFavorite();
+	player.jump(1);
+	player.toggleFavorite();
+	const client = { songUrl: async (id) => `https://audio.test/${id}.mp3` };
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		client, {}, player, {}, { recordPlayback: async () => {} }
+	);
+	assert.deepEqual((await actions.favoritesList()).songs.map((item) => item.id), [1, 2]);
+	const played = await actions.queue({ action: 'favorites', favoriteIndex: 1 });
+	assert.equal(played.playedName, '夜曲');
+	assert.deepEqual(player.state.queue.map((item) => item.id), [1, 2]);
+	assert.equal(player.state.index, 1);
 });
 
 test('search does not inject an unverified cross-source recording', async () => {

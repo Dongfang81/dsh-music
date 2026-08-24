@@ -65,6 +65,20 @@ test('favorites stay as one flat list when loading state written by the collecti
 	assert.equal(player.playFavorites().count, 2);
 });
 
+test('playing favorites from one row keeps the full favorite list as playback context', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '晴天'), song(2, '夜曲'), song(3, '七里香')]);
+	for (let index = 0; index < 3; index += 1) {
+		player.jump(index);
+		player.toggleFavorite();
+	}
+	const result = player.playFavorites(1);
+	assert.equal(result.song.id, 2);
+	assert.equal(result.count, 3);
+	assert.deepEqual(player.state.queue.map((item) => item.id), [1, 2, 3]);
+	assert.equal(player.state.index, 1);
+});
+
 test('removing a non-current queue item preserves the active song and undo restores order', () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([song(1, '一'), song(2, '二'), song(3, '三'), song(4, '四')]);
