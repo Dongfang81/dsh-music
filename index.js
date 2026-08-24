@@ -38,6 +38,9 @@ import { createLocalLibrary } from './lib/recommendation/local-library.js';
 import { createRetrievers } from './lib/recommendation/retrievers.js';
 import { createSourceResolver } from './lib/recommendation/source-resolver.js';
 import { createRecommendationCoordinator } from './lib/recommendation/coordinator.js';
+import { createRecommendationPool } from './lib/recommendation/pool.js';
+import { createRecommendationGenerator } from './lib/recommendation/generator.js';
+import { createRecommendationScheduler } from './lib/recommendation/scheduler.js';
 
 export const name = '@dongfang81/dsh-music';
 export const inject = ['subprocess', 'tools', 'webServer'];
@@ -155,10 +158,15 @@ function normalize(s) {
 function buildActions(cfg, client, shared, player, apiHandle, habits, recommendation = {}) {
 	const coordinator = recommendation.coordinator ?? null;
 	const preference = recommendation.preference ?? null;
-	const feedback = (type, song) => {
-		if (!cfg.recommendationLearning || !coordinator || !song) return;
-		const track = song.trackKey ? song : normalizeTrack(song, 'player');
-		if (track) coordinator.feedback({ type, track }).catch(() => {});
+	const pool = recommendation.pool ?? null;
+	const scheduler = recommendation.scheduler ?? null;
+	const refreshSignals = new Set(['favorite', 'unfavorite', 'search-play']);
+	const feedback = async (type, song) => {
+		if (cfg.recommendationLearning && coordinator && song) {
+			const track = song.trackKey ? song : normalizeTrack(song, 'player');
+			if (track) await coordinator.feedback({ type, track }).catch(() => {});
+		}
+		if (refreshSignals.has(type)) scheduler?.schedule(type);
 	};
 	// 宠物台词/通知（agent → 宠物气泡，约 6 秒）
 	const noticeStore = { text: '', until: 0 };
@@ -254,13 +262,31 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			return { ok: true, text };
 		},
 
-		/** 按钮/明确工具请求的快速推荐：本地协调器直接执行，不经过 LLM。 */
-		async recommend(args) {
+		/** 按钮/明确工具请求的快速推荐：只消费后台准备好的推荐池。 */
+		async recommend(_args) {
 			if (!(await apiUp())) return { ok: false, guidance: '音乐服务尚未就绪，当前播放和队列保持不变。' };
-			if (!coordinator) return { ok: false, guidance: '推荐模块未能初始化，当前播放和队列保持不变。' };
-			const result = await coordinator.recommend(asRecord(args));
-			if (result.ok) shared.setNotice(`♫ 已为你接上 ${result.tracks.length} 首，当前这首继续播`);
-			return result;
+			if (!pool) return { ok: false, preparing: true, guidance: '推荐池尚未初始化，请稍后再试。' };
+			const consumed = await pool.consume(30);
+			if (!consumed.ok) {
+				scheduler?.schedule('cold-start');
+				return { ok: false, preparing: true, count: 0, remaining: consumed.remaining, guidance: '推荐正在准备中，请稍后再试。' };
+			}
+			try {
+				player.insertRecommendationAfterCurrent(consumed.tracks, 'button-recommendation');
+				await pool.commit(consumed.transaction);
+			} catch (error) {
+				await pool.restore(consumed.transaction).catch(() => {});
+				throw error;
+			}
+			if (consumed.remaining <= 30) scheduler?.schedule('low-watermark');
+			shared.setNotice('♫ 已为你接上 30 首，当前这首继续播');
+			return {
+				ok: true,
+				insertMode: 'after-current',
+				count: consumed.tracks.length,
+				tracks: consumed.tracks,
+				remaining: consumed.remaining
+			};
 		},
 
 		/** alger_setup：内置音乐服务管理 */
@@ -517,7 +543,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			// 3) 写入播放状态（客户端轮询到 currentUrl 后自动播放）
 			player.playSong(song);
 			player.state.currentUrl = url;
-			feedback('search-play', song);
+			await feedback('search-play', song);
 			shared.setNotice('♪ 已播放：' + song.name);
 			return { ok: true, steps, playedName: song.name, playedId: song.id, confirmed: true };
 		},
@@ -686,8 +712,8 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			if (action === 'next' || action === 'prev') {
 				const leaving = player.current();
 				if (action === 'next' && leaving) {
-					if (player.state.position > 0 && player.state.position < 20) feedback('skip-short', leaving);
-					else if (player.state.duration > 0 && player.state.position / player.state.duration >= 0.8) feedback('complete-80', leaving);
+					if (player.state.position > 0 && player.state.position < 20) await feedback('skip-short', leaving);
+					else if (player.state.duration > 0 && player.state.position / player.state.duration >= 0.8) await feedback('complete-80', leaving);
 				}
 				const song = action === 'next' ? player.next() : player.prev();
 				if (!song) throw new Error('队列为空，无法切换。');
@@ -703,7 +729,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			}
 			if (action === 'toggle-favorite') {
 				const r = player.toggleFavorite();
-				if (r.favorite) feedback('favorite', player.current());
+				await feedback(r.favorite ? 'favorite' : 'unfavorite', player.current());
 				return { action, message: r.favorite ? '已收藏' : '已取消收藏', favorite: r.favorite };
 			}
 			if (action === 'playmode') {
@@ -716,7 +742,10 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		/** 仅供明确的长期偏好指令使用；普通对话不会自动写入。 */
 		async preference(args) {
 			if (!preference) throw new Error('偏好档案未初始化');
-			return preference(asRecord(args));
+			const value = asRecord(args);
+			const result = await preference(value);
+			if (String(value.action || 'summary') !== 'summary') scheduler?.schedule('preference');
+			return result;
 		},
 
 		/** alger_habits：听歌记忆（查看/清空本地播放习惯，纯本地不上传） */
@@ -1405,6 +1434,9 @@ export function apply(ctx, config) {
 	let localLibrary = null;
 	let sourceResolver = null;
 	let coordinator = null;
+	let recommendationPool = null;
+	let recommendationGenerator = null;
+	let recommendationScheduler = null;
 	try {
 		tasteProfile = createTasteProfile({ file: join(dataRoot, 'moony-singer-recommendation.json') });
 		if (cfg.recommendationLearning) {
@@ -1443,19 +1475,50 @@ export function apply(ctx, config) {
 	}
 	try {
 		if (tasteProfile && sourceResolver) {
+			const retrievers = createRetrievers({ client, localLibrary, timeoutMs: Math.min(cfg.timeoutMs, 3500) });
 			coordinator = createRecommendationCoordinator({
 				player,
 				profile: tasteProfile,
 				client,
 				localLibrary,
-				retrievers: createRetrievers({ client, localLibrary, timeoutMs: Math.min(cfg.timeoutMs, 3500) }),
+				retrievers,
 				resolver: sourceResolver,
 				targetSize: Math.max(1, Math.min(30, Number(cfg.recommendationTargetSize) || 15)),
 				timeoutMs: Math.max(3000, Number(cfg.timeoutMs) || 20000)
 			});
+			recommendationPool = createRecommendationPool({
+				file: join(dataRoot, 'moony-singer-recommendation-pool.json'),
+				targetSize: 60,
+				batchSize: 30,
+				historySize: 120
+			});
+			recommendationGenerator = createRecommendationGenerator({
+				pool: recommendationPool,
+				player,
+				profile: tasteProfile,
+				client,
+				localLibrary,
+				retrievers,
+				resolver: sourceResolver,
+				targetSize: 60
+			});
+			recommendationScheduler = createRecommendationScheduler({
+				debounceMs: 2000,
+				generate: async (input) => {
+					const result = await recommendationGenerator.generate(input);
+					if (!result.ok) throw new Error(result.error || result.reason || '推荐池生成失败');
+					return result;
+				}
+			});
+			recommendationPool.load().then((state) => {
+				if (state.items.length < 30) recommendationScheduler.schedule('startup');
+			}).catch((error) => {
+				console.warn('[dsh-moony-singer] 推荐池加载失败: ' + ((error && error.message) || String(error)));
+				recommendationScheduler.schedule('startup-recovery');
+			});
 		}
 	} catch (error) {
-		console.warn('[dsh-moony-singer] 推荐协调器初始化失败: ' + ((error && error.message) || String(error)));
+		console.warn('[dsh-moony-singer] 推荐系统初始化失败: ' + ((error && error.message) || String(error)));
 	}
 
 	// 内置音乐 API 服务（netease-cloud-music-api-alger）自动启动
@@ -1536,7 +1599,9 @@ export function apply(ctx, config) {
 	const actions = buildActions(cfg, client, shared, player, apiHandle, habits, {
 		coordinator,
 		preference: tasteProfile ? createPreferenceAction(tasteProfile) : null,
-		localLibrary
+		localLibrary,
+		pool: recommendationPool,
+		scheduler: recommendationScheduler
 	});
 	const disposers = [];
 	for (const definition of buildTools(cfg, actions)) {
@@ -1549,6 +1614,7 @@ export function apply(ctx, config) {
 	if (typeof ctx.on === 'function') {
 		ctx.on('dispose', () => {
 			coordinator?.cancel('plugin disposed');
+			recommendationScheduler?.dispose();
 			for (const dispose of disposers) dispose();
 			if (apiHandle && apiHandle.handle) {
 				stopApiServer(apiHandle.handle).catch(() => {});

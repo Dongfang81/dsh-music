@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 import * as plugin from '../../index.js';
 import { createPlayer } from '../../lib/player.js';
+import { normalizeTrack } from '../../lib/recommendation/identity.js';
 
 const { buildToolsForTest, createPreferenceAction, registerRoutesForTest, resolveDataRoot } = plugin;
 
@@ -29,7 +30,7 @@ function response() {
 	};
 }
 
-test('recommend route invokes the local coordinator action directly', async () => {
+test('recommend route invokes the cached recommendation action directly', async () => {
 	const routes = [];
 	let calls = 0;
 	registerRoutesForTest({ register: (route) => routes.push(route) }, {
@@ -42,6 +43,66 @@ test('recommend route invokes the local coordinator action directly', async () =
 	assert.equal(res.body.ok, true);
 	assert.equal(res.body.insertMode, 'after-current');
 	assert.equal(res.body.requestId, 'button-1');
+});
+
+test('recommend action consumes 30 cached tracks without invoking click-time generation', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '当前', ar: [{ name: '歌手' }] }, { id: 2, name: '手动', ar: [{ name: '歌手' }] }]);
+	const recommended = Array.from({ length: 30 }, (_, index) => ({
+		...normalizeTrack({ id: index + 100, name: `推荐${index + 1}`, artists: `推荐歌手${index + 1}` }, 'pool')
+	}));
+	let coordinatorCalls = 0;
+	let committed = null;
+	const scheduled = [];
+	const pool = {
+		consume: async () => ({ ok: true, tracks: recommended, transaction: 'tx-1', remaining: 30, ready: true }),
+		commit: async (transaction) => { committed = transaction; },
+		restore: async () => { throw new Error('should not restore'); },
+		snapshot: async () => ({ ready: true, items: recommended, count: 30 })
+	};
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} },
+		{
+			coordinator: { recommend: async () => { coordinatorCalls += 1; }, feedback: async () => true },
+			pool,
+			scheduler: { schedule: (reason) => scheduled.push(reason), status: () => ({ state: 'idle' }) }
+		}
+	);
+	const result = await actions.recommend({ requestId: 'cached-1' });
+	assert.equal(result.ok, true);
+	assert.equal(result.count, 30);
+	assert.equal(coordinatorCalls, 0);
+	assert.equal(committed, 'tx-1');
+	assert.deepEqual(scheduled, ['low-watermark']);
+	assert.deepEqual(player.state.queue.slice(1, 31).map((item) => item.name), recommended.map((item) => item.title));
+	assert.equal(player.state.queue.at(-1).name, '手动');
+});
+
+test('strong preference signals schedule refresh while skip and completion only update history', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([
+		{ id: 1, name: '当前', ar: [{ name: '歌手一' }] },
+		{ id: 2, name: '下一首', ar: [{ name: '歌手二' }] }
+	]);
+	const scheduled = [];
+	const feedback = [];
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true, songUrl: async (id) => `https://audio/${id}` }, {}, player, {}, { recordPlayback: async () => {} },
+		{
+			coordinator: { feedback: async (event) => feedback.push(event.type) },
+			preference: async (args) => ({ ok: true, action: args.action }),
+			scheduler: { schedule: (reason) => scheduled.push(reason), status: () => ({ state: 'idle' }) }
+		}
+	);
+	await actions.control({ action: 'toggle-favorite' });
+	await actions.control({ action: 'toggle-favorite' });
+	player.state.position = 5;
+	await actions.control({ action: 'next' });
+	await actions.preference({ action: 'remember', kind: 'artist', value: '周杰伦' });
+	assert.deepEqual(scheduled, ['favorite', 'unfavorite', 'preference']);
+	assert.deepEqual(feedback, ['favorite', 'unfavorite', 'skip-short']);
 });
 
 test('favorites route exposes one flat read-only song list', async () => {

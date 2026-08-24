@@ -27,6 +27,15 @@ test('same-session replan replaces only its unplayed recommendation entries', ()
 	assert.equal(player.state.queue[1].recommendationSessionId, 'session-1');
 });
 
+test('a second button batch replaces unplayed recommendations and preserves manual songs', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '当前'), song(2, '手动加入')]);
+	player.insertRecommendationAfterCurrent([song(3, '旧推荐一'), song(4, '旧推荐二')], 'button-recommendation');
+	player.insertRecommendationAfterCurrent([song(5, '新推荐一'), song(6, '新推荐二')], 'button-recommendation');
+	assert.deepEqual(player.state.queue.map((item) => item.name), ['当前', '新推荐一', '新推荐二', '手动加入']);
+	assert.equal(player.current().name, '当前');
+});
+
 test('canonical recommendation tracks are converted back to player song shape', () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([song(1, '当前')]);
