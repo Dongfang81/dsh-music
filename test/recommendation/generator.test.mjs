@@ -92,7 +92,7 @@ test('tops up an incomplete pool with new verified tracks instead of replacing a
 	assert.deepEqual(state.items.slice(0, 2).map((track) => track.trackKey), tracks(2, 2000).map((track) => track.trackKey));
 });
 
-test('unplayed button recommendations stay eligible when they will be replaced on the next click', async () => {
+test('unplayed button recommendations use soft queue penalties when refilling a depleted pool', async () => {
 	const dir = await mkdtemp(join(tmpdir(), 'moony-recover-generator-'));
 	const pool = createRecommendationPool({ file: join(dir, 'pool.json') });
 	await pool.replace(tracks(48, 1000), { generationId: 'partial' });

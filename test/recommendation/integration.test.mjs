@@ -84,6 +84,48 @@ test('recommend action consumes 30 cached tracks without invoking click-time gen
 	assert.equal(result.insertMode, 'after-current-and-play');
 });
 
+test('consecutive button recommendations keep every earlier song and add 30 more', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([
+		{ id: 1, name: '当前', ar: [{ name: '歌手' }] },
+		{ id: 2, name: '手动', ar: [{ name: '歌手' }] }
+	]);
+	const makeBatch = (label, offset) => Array.from({ length: 30 }, (_, index) => normalizeTrack({
+		id: offset + index,
+		name: `${label}${index + 1}`,
+		artists: `${label}歌手${index + 1}`
+	}, 'pool'));
+	const batches = [makeBatch('第一批', 100), makeBatch('第二批', 200)];
+	let batchIndex = 0;
+	const pool = {
+		consume: async () => ({
+			ok: true,
+			tracks: batches[batchIndex],
+			transaction: `tx-${++batchIndex}`,
+			remaining: 30,
+			ready: true
+		}),
+		commit: async () => {},
+		restore: async () => {},
+		snapshot: async () => ({ ready: true, count: 60, items: batches.flat() })
+	};
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true, songUrl: async (id) => `https://audio.test/${id}.mp3` },
+		{}, player, {}, { recordPlayback: async () => {} },
+		{ pool, scheduler: { schedule: () => true, status: () => ({ state: 'idle' }) } }
+	);
+
+	await actions.recommend({ requestId: 'first' });
+	await actions.recommend({ requestId: 'second' });
+
+	assert.equal(player.state.queue.length, 62);
+	assert.equal(player.state.queue.filter((song) => song.recommendationSessionId === 'button-recommendation').length, 60);
+	assert.equal(player.state.queue.filter((song) => song.name.startsWith('第一批')).length, 30);
+	assert.equal(player.current().name, '第二批1');
+	assert.equal(player.state.queue.at(-1).name, '手动');
+});
+
 test('status exposes recommendation pool readiness without starting generation', async () => {
 	let generationCalls = 0;
 	const player = createPlayer({ file: null });
@@ -223,7 +265,12 @@ test('tool copy preserves natural dialogue and only recommends on an explicit re
 	assert.match(tools.alger_recommend.description, /明确要求.*立即推荐|直接播放/);
 	assert.match(tools.alger_recommend.description, /自然回应/);
 	assert.match(tools.alger_recommend.description, /不要.*自动搜索/);
+	assert.match(tools.alger_recommend.description, /第一首推荐.*播放/);
+	assert.doesNotMatch(tools.alger_recommend.description, /保留当前歌曲/);
 	assert.doesNotMatch(tools.alger_recommend.description, /随机挑一个整单/);
+	const rendered = JSON.stringify(tools.alger_recommend.output.render({}, { ok: true, tracks: [{ title: '推荐一' }] }));
+	assert.match(rendered, /开始播放/);
+	assert.doesNotMatch(rendered, /保持不变/);
 	assert.match(tools.alger_preference.description, /明确.*记住|以后/);
 });
 

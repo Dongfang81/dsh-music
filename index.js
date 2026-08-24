@@ -283,7 +283,10 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				return { ok: false, preparing: true, count: 0, remaining: consumed.remaining, guidance: '推荐正在准备中，请稍后再试。' };
 			}
 			try {
-				player.insertRecommendationAfterCurrent(consumed.tracks, 'button-recommendation', { playFirst: true });
+				player.insertRecommendationAfterCurrent(consumed.tracks, 'button-recommendation', {
+					playFirst: true,
+					replaceUnplayed: false
+				});
 				const hit = await urlFor(player.current());
 				player.state.currentUrl = hit ? hit.url : null;
 				if (!hit) player.state.playing = false;
@@ -1099,14 +1102,14 @@ function buildTools(cfg, actions) {
 	const recommend = {
 		name: 'alger_recommend',
 		description:
-			'仅在用户明确要求立即推荐、直接播放或“来一批歌”时调用。按钮式快速推荐会保留当前歌曲并把结果接在后面；如果用户只是在表达情绪、犹豫或闲聊，应先自然回应、提供情绪价值和想法，不要为了结构化而自动搜索或急着给结果。',
+			'仅在用户明确要求立即推荐、直接播放或“来一批歌”时调用。按钮式快速推荐会把完整一批歌曲加入播放列表，并从第一首推荐开始播放；如果用户只是在表达情绪、犹豫或闲聊，应先自然回应、提供情绪价值和想法，不要为了结构化而自动搜索或急着给结果。',
 		parameters: compileParameters({}),
 		output: {
 			schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
 			render: (_args, value) => {
 				const rec = asRecord(value);
 				const lines = [];
-				if (rec.ok) lines.push('♫ 已接上 ' + ((rec.tracks || []).length || 0) + ' 首推荐，当前歌曲保持不变。');
+				if (rec.ok) lines.push('♫ 已加入 ' + ((rec.tracks || []).length || 0) + ' 首推荐，并开始播放本批第一首。');
 				if (rec.guidance) lines.push('提示: ' + rec.guidance);
 				return textBlock(lines);
 			}
