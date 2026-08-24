@@ -43,6 +43,23 @@ test('recent short skips produce a bounded penalty', () => {
 	assert.ok(scored.penalties.skip >= -60);
 });
 
+test('recent recommendation history lowers rank without excluding the track', () => {
+	const neutral = scoreCandidate(jay, context, { tracks: {}, artists: {}, rules: [] });
+	const recent = scoreCandidate(jay, { ...context, recentRecommendedTrackKeys: [jay.trackKey] }, { tracks: {}, artists: {}, rules: [] });
+	assert.equal(recent.excluded, false);
+	assert.ok(recent.penalties.recentRecommendation < 0);
+	assert.ok(recent.total < neutral.total);
+});
+
+test('newer recommendations receive a stronger penalty than older history', () => {
+	const older = track('较早推荐', '甲');
+	const newest = track('刚刚推荐', '乙');
+	const history = [older.trackKey, ...Array.from({ length: 30 }, (_, index) => `middle-${index}`), newest.trackKey];
+	const oldScore = scoreCandidate(older, { ...context, recentRecommendedTrackKeys: history }, { tracks: {}, artists: {}, rules: [] });
+	const newScore = scoreCandidate(newest, { ...context, recentRecommendedTrackKeys: history }, { tracks: {}, artists: {}, rules: [] });
+	assert.ok(newScore.penalties.recentRecommendation < oldScore.penalties.recentRecommendation);
+});
+
 test('unplayable and explicitly disliked tracks are filtered before ranking', () => {
 	const unplayable = track('无地址', '甲', { playable: false });
 	const disliked = track('不想听', '乙');
