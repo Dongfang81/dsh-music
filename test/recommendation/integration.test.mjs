@@ -5,7 +5,10 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildToolsForTest, createPreferenceAction, registerRoutesForTest, resolveDataRoot } from '../../index.js';
+import * as plugin from '../../index.js';
+import { createPlayer } from '../../lib/player.js';
+
+const { buildToolsForTest, createPreferenceAction, registerRoutesForTest, resolveDataRoot } = plugin;
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 
@@ -39,6 +42,51 @@ test('recommend route invokes the local coordinator action directly', async () =
 	assert.equal(res.body.ok, true);
 	assert.equal(res.body.insertMode, 'after-current');
 	assert.equal(res.body.requestId, 'button-1');
+});
+
+test('favorites route forwards collection organization requests', async () => {
+	const routes = [];
+	registerRoutesForTest({ register: (route) => routes.push(route) }, {
+		favorites: async (input) => ({ ok: true, action: input.action, name: input.name })
+	});
+	const route = routes.find((item) => item.path === '/dsh-alger/favorites');
+	assert.ok(route, 'favorites route must be registered');
+	const res = response();
+	await route.handler(request({ action: 'create', name: '工作' }), res);
+	assert.deepEqual(res.body, { ok: true, action: 'create', name: '工作' });
+});
+
+test('real actions organize collections and resolve playback after removing the current song', async () => {
+	assert.equal(typeof plugin.buildActionsForTest, 'function', 'real action factory must be testable');
+	const player = createPlayer({ file: null, createCollectionId: () => 'focus' });
+	player.replaceAndPlay([
+		{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] },
+		{ id: 2, name: '夜曲', ar: [{ name: '周杰伦' }] }
+	]);
+	player.toggleFavorite();
+	const client = {
+		musicApiUp: async () => true,
+		songUrl: async (id) => `https://audio.test/${id}.mp3`
+	};
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		client,
+		{},
+		player,
+		{},
+		{ recordPlayback: async () => {} }
+	);
+
+	assert.equal((await actions.favorites({ action: 'create', name: '工作' })).collection.id, 'focus');
+	await actions.favorites({ action: 'set-memberships', songId: 1, collectionIds: ['focus'] });
+	const listed = await actions.favorites({ action: 'list', collectionId: 'focus' });
+	assert.deepEqual(listed.songs.map((item) => item.id), [1]);
+
+	const removed = await actions.queue({ action: 'remove', index: 0 });
+	assert.equal(removed.currentChanged, true);
+	assert.equal(player.current().id, 2);
+	assert.equal(player.state.currentUrl, 'https://audio.test/2.mp3');
+	assert.equal((await actions.queue({ action: 'undo-remove', token: removed.token })).restored.id, 1);
 });
 
 test('tool copy preserves natural dialogue and only recommends on an explicit request', () => {

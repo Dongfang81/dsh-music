@@ -281,6 +281,9 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					? { position: snap.position, duration: snap.duration, playing: snap.isPlaying }
 					: null,
 				favorite: snap.favorite,
+				favoriteIds: snap.favoriteIds,
+				favoriteCount: snap.favoriteCount,
+				favoriteCollections: snap.favoriteCollections,
 				playMode: snap.playMode,
 				volume: snap.volume,
 				currentUrl: snap.currentUrl,
@@ -559,10 +562,37 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		/** alger_queue：播放列表操作（追加 / 插入下一首 / 整单播放 / 跳转 / 清空） */
 		async queue(args) {
 			const action = String(args?.action ?? '');
-			if (!['add', 'add-all', 'add-next', 'playlist', 'playlist-add', 'jump', 'clear', 'favorites'].includes(action))
-				throw new Error('action 需为 add / add-all / add-next / playlist / playlist-add / jump / clear / favorites。');
+			if (!['add', 'add-all', 'add-next', 'playlist', 'playlist-add', 'jump', 'clear', 'favorites', 'remove', 'undo-remove'].includes(action))
+				throw new Error('action 需为 add / add-all / add-next / playlist / playlist-add / jump / clear / favorites / remove / undo-remove。');
 			const steps = [];
 			const log = (s) => steps.push(String(s));
+
+			if (action === 'remove') {
+				const result = player.removeQueueAt(args?.index);
+				if (result.currentChanged && result.current) {
+					const hit = await urlFor(result.current);
+					player.state.currentUrl = hit ? hit.url : null;
+					if (!hit) player.state.playing = false;
+				}
+				return {
+					ok: true,
+					mode: 'remove',
+					removed: compactSong(result.removed),
+					token: result.token,
+					currentChanged: result.currentChanged,
+					queueLength: result.queueLength,
+					playing: result.current ? compactSong(result.current) : null
+				};
+			}
+			if (action === 'undo-remove') {
+				const result = player.undoQueueRemoval(args?.token);
+				return {
+					ok: true,
+					mode: 'undo-remove',
+					restored: compactSong(result.restored),
+					queueLength: result.queueLength
+				};
+			}
 
 			// 清空播放列表
 			if (action === 'clear') {
@@ -654,6 +684,51 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const n = player.append(songs);
 			shared.setNotice('＋ 已加入播放列表 ' + songs.length + ' 首');
 			return { ok: true, steps, mode, added: songs.length, queueLength: n, playedName: null };
+		},
+
+		/** 收藏集整理：全局收藏仍只由红心 toggle-favorite 控制。 */
+		async favorites(args) {
+			const action = String(args?.action ?? 'list');
+			if (action === 'list') {
+				const collection = player.favoriteCollection(String(args?.collectionId || 'all'));
+				return {
+					ok: true,
+					collections: player.listFavoriteCollections(),
+					collection: { id: collection.id, name: collection.name, count: collection.count, system: Boolean(collection.system) },
+					songs: collection.songs.map(compactSong)
+				};
+			}
+			if (action === 'create') {
+				return { ok: true, collection: player.createFavoriteCollection(args?.name), collections: player.listFavoriteCollections() };
+			}
+			if (action === 'rename') {
+				return { ok: true, collection: player.renameFavoriteCollection(args?.collectionId, args?.name), collections: player.listFavoriteCollections() };
+			}
+			if (action === 'delete') {
+				player.deleteFavoriteCollection(args?.collectionId);
+				return { ok: true, deleted: String(args?.collectionId), collections: player.listFavoriteCollections() };
+			}
+			if (action === 'set-memberships') {
+				const songId = Number(args?.songId);
+				if (!player.isFavorite(songId)) {
+					const current = player.current();
+					if (!current || Number(current.id) !== songId) throw new Error('只能整理已收藏歌曲或当前播放歌曲');
+					player.toggleFavorite();
+					feedback('favorite', current);
+				}
+				const collectionIds = player.setFavoriteMemberships(songId, args?.collectionIds);
+				return { ok: true, songId, collectionIds, collections: player.listFavoriteCollections() };
+			}
+			if (action === 'play') {
+				const result = player.playFavoriteCollection(String(args?.collectionId || 'all'));
+				if (!result.song) return { ok: false, guidance: '这个收藏集还是空的。' };
+				const hit = await urlFor(result.song);
+				if (!hit) return { ok: false, guidance: '收藏集第一首暂时没有可用播放地址。' };
+				player.state.currentUrl = hit.url;
+				player.state.playing = true;
+				return { ok: true, collection: result.collection, added: result.count, queueLength: player.state.queue.length, playedName: result.song.name };
+			}
+			throw new Error('action 需为 list / create / rename / delete / set-memberships / play');
 		},
 
 		/** alger_control：播放控制（内置状态机） */
@@ -784,6 +859,8 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		}
 	};
 }
+
+export const buildActionsForTest = buildActions;
 
 
 /**
@@ -1243,6 +1320,18 @@ function registerRoutes(webServer, actions) {
 				try {
 					const body = JSON.parse((await readBody(req)) || '{}');
 					json(res, await actions.recommend(body));
+				} catch (error) {
+					json(res, { ok: false, error: String((error && error.message) || error) });
+				}
+			}
+		},
+		{
+			kind: 'exact',
+			path: '/dsh-alger/favorites',
+			handler: async (req, res) => {
+				try {
+					const body = JSON.parse((await readBody(req)) || '{}');
+					json(res, await actions.favorites(body));
 				} catch (error) {
 					json(res, { ok: false, error: String((error && error.message) || error) });
 				}
