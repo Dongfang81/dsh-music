@@ -46,6 +46,26 @@ test('relaxes the artist cap only when needed to fill the requested pool', () =>
 	}
 });
 
+test('allows one fourth song from an artist only to close the final pool shortfall', () => {
+	const diverse = Array.from({ length: 56 }, (_, index) => ranked(`独立${index + 1}`, `歌手${index + 1}`, 100 - index));
+	const plan = planQueue({
+		ranked: diverse.concat([
+			ranked('A1', '甲', 40), ranked('A2', '甲', 39),
+			ranked('A3', '甲', 38), ranked('A4', '甲', 37)
+		]),
+		targetSize: 60,
+		rng: () => 0.5,
+		currentTrack,
+		existingQueue: []
+	});
+
+	assert.equal(plan.tracks.length, 60);
+	assert.equal(plan.tracks.filter((track) => track.artists[0] === '甲').length, 4);
+	for (let index = 1; index < plan.tracks.length; index += 1) {
+		assert.notEqual(plan.tracks[index - 1].artists[0], plan.tracks[index].artists[0]);
+	}
+});
+
 test('puts three high-confidence choices first and returns an honest short queue', () => {
 	const rankedTracks = [
 		ranked('低1', '甲', 100, 0.7), ranked('高1', '乙', 99, 0.96),
