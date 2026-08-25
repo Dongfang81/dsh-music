@@ -171,3 +171,33 @@ test('generation passes cancellation through candidate collection and stops clea
 	assert.equal(result.ok, false);
 	assert.match(result.error, /generation cancelled/);
 });
+
+test('excludes tracks already heard in the active radio session and applies the exploration cap', async () => {
+	const dir = await mkdtemp(join(tmpdir(), 'moony-radio-generator-'));
+	const pool = createRecommendationPool({ file: join(dir, 'pool.json') });
+	const [seen, ...fresh] = tracks(62);
+	let planningOptions = null;
+	const generator = createRecommendationGenerator({
+		pool,
+		player: {
+			current: () => null,
+			state: { queue: [] },
+			radioStatus: () => ({ active: true, seenTrackKeys: [seen.trackKey] })
+		},
+		profile: { snapshot: async () => ({ tracks: {}, artists: {}, rules: [], resolverStats: {} }) },
+		collectCandidates: async () => ({ tracks: [seen, ...fresh], failures: [] }),
+		rankCandidates: ({ candidates }) => candidates.map((track, index) => ({ track, total: 100 - index })),
+		planQueue: (options) => {
+			planningOptions = options;
+			return { tracks: options.ranked.slice(0, options.targetSize).map((entry) => entry.track), shortfall: 0 };
+		},
+		resolver: { resolve: async (track) => ({ playable: true, url: `https://temporary/${track.trackKey}` }) },
+		targetSize: 60
+	});
+
+	const result = await generator.generate({ reasons: ['radio-next-batch'] });
+	const state = await pool.snapshot();
+	assert.equal(result.ok, true);
+	assert.equal(planningOptions.maxExplorationRatio, 0.2);
+	assert.equal(state.items.some((track) => track.trackKey === seen.trackKey), false);
+});

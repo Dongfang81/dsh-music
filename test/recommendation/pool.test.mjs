@@ -40,6 +40,23 @@ test('consumes 30 tracks from 60 and commits bounded recent history', async () =
 	assert.equal(pool.needsRefill(), true);
 });
 
+test('excludes active radio tracks while transactionally consuming a full batch', async () => {
+	const { pool } = await fixture();
+	await pool.replace(tracks(60), { generationId: 'radio-exclusions' });
+	const excluded = tracks(5).map((track) => track.trackKey);
+	const result = await pool.consume(30, { excludeTrackKeys: excluded });
+
+	assert.equal(result.ok, true);
+	assert.equal(result.tracks.length, 30);
+	assert.equal(result.tracks.some((track) => excluded.includes(track.trackKey)), false);
+	assert.equal(result.remaining, 30);
+	await pool.restore(result.transaction);
+	const restored = await pool.snapshot();
+	assert.equal(restored.items.length, 60);
+	assert.deepEqual(new Set(restored.items.map((track) => track.trackKey)), new Set(tracks(60).map((track) => track.trackKey)));
+	assert.deepEqual(restored.recentRecommendedTrackKeys, []);
+});
+
 test('status exposes pool metadata without cloning or returning track items', async () => {
 	const { pool } = await fixture();
 	await pool.replace(tracks(60), { generationId: 'metadata-only', profileRevision: 42 });
@@ -121,4 +138,32 @@ test('loads a corrupt file as an empty cold-start pool instead of throwing', asy
 	await pool.replace(tracks(30), { generationId: 'cold-start' });
 	const persisted = JSON.parse(await readFile(file, 'utf8'));
 	assert.equal(persisted.items.length, 30);
+});
+
+test('sanitizes malformed legacy rows without discarding healthy pool tracks', async () => {
+	const { file } = await fixture();
+	const healthy = tracks(2);
+	await writeFile(file, JSON.stringify({
+		version: 1,
+		generationId: 'legacy',
+		generatedAt: 1,
+		profileRevision: 0,
+		items: [
+			healthy[0],
+			{ trackKey: 'bad-placeholder', title: '异常一', artists: ['[Object Object]'] },
+			{ trackKey: 'bad-nested', title: '异常二', artists: [{ name: { name: '嵌套对象' } }] },
+			{ ...healthy[0] },
+			healthy[1]
+		],
+		recentRecommendedTrackKeys: ['old-one', null, 'old-one'],
+		lastGenerationStatus: null,
+		pending: null
+	}, null, 2), 'utf8');
+
+	const pool = createRecommendationPool({ file });
+	const state = await pool.load();
+	assert.deepEqual(state.items.map((track) => track.trackKey), healthy.map((track) => track.trackKey));
+	assert.deepEqual(state.recentRecommendedTrackKeys, ['old-one']);
+	const persisted = JSON.parse(await readFile(file, 'utf8'));
+	assert.deepEqual(persisted.items.map((track) => track.trackKey), healthy.map((track) => track.trackKey));
 });

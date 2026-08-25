@@ -91,6 +91,7 @@ window.__ModuleLoader__.load({
 			var queue = state.queue || {};
 			var favorites = state.favorites || {};
 			var recommendation = state.recommendation || {};
+			var radio = recommendation.radio || {};
 			return JSON.stringify([
 				state.ok, state.musicApiUp, state.stateRevision,
 				song.id, song.name, playing.isPlaying,
@@ -99,7 +100,8 @@ window.__ModuleLoader__.load({
 				state.currentUrl, state.ready, state.notice, state.agentStatus,
 				queue.count, queue.index, queue.revision,
 				favorites.count, favorites.revision,
-				recommendation.ready, recommendation.count, recommendation.generating, recommendation.lastError
+				recommendation.ready, recommendation.count, recommendation.generating, recommendation.lastError,
+				radio.active, radio.batchNumber, radio.waitingForNextBatch
 			]);
 		}
 
@@ -1426,6 +1428,11 @@ window.__ModuleLoader__.load({
 			var [busy, setBusy] = React.useState(false);
 			var [recommendBusy, setRecommendBusy] = React.useState(false);
 			var recommendRequestRef = React.useRef(0);
+			var radioRetryTimerRef = React.useRef(null);
+			var radioRetryAttemptRef = React.useRef(0);
+			var radioAdvanceTokenRef = React.useRef(0);
+			var advancePlaybackRef = React.useRef(null);
+			var performRadioAdvanceRef = React.useRef(null);
 			var [lrc, setLrc] = React.useState(null); // [{t,text}] 当前歌歌词
 			var [lyricsOpen, setLyricsOpen] = React.useState(false); // 展开视图歌词面板
 			var [shareOpen, setShareOpen] = React.useState(false); // 微信分享面板
@@ -1469,6 +1476,48 @@ window.__ModuleLoader__.load({
 				if (statePollerRef.current) return statePollerRef.current.refresh();
 				return requestState().catch(function () { /* 忽略瞬时失败 */ });
 			}, [requestState]);
+
+			var cancelRadioAdvance = React.useCallback(function () {
+				radioAdvanceTokenRef.current += 1;
+				radioRetryAttemptRef.current = 0;
+				if (radioRetryTimerRef.current !== null) {
+					clearTimeout(radioRetryTimerRef.current);
+					radioRetryTimerRef.current = null;
+				}
+			}, []);
+			var performRadioAdvance = React.useCallback(function (token) {
+				return command("next").then(function (r) {
+					if (token !== radioAdvanceTokenRef.current) return r;
+					if (r && r.preparing) {
+						var delay = Math.min(5000, 600 * Math.pow(1.7, radioRetryAttemptRef.current));
+						radioRetryAttemptRef.current += 1;
+						if (radioRetryTimerRef.current !== null) clearTimeout(radioRetryTimerRef.current);
+						radioRetryTimerRef.current = setTimeout(function () {
+							radioRetryTimerRef.current = null;
+							if (performRadioAdvanceRef.current) performRadioAdvanceRef.current(token);
+						}, delay);
+						refresh();
+						return r;
+					}
+					radioRetryAttemptRef.current = 0;
+					setTimeout(refresh, 120);
+					return r;
+				}).catch(function () {
+					if (token === radioAdvanceTokenRef.current) setTimeout(refresh, 500);
+					return null;
+				});
+			}, [refresh]);
+			performRadioAdvanceRef.current = performRadioAdvance;
+			advancePlaybackRef.current = function () {
+				cancelRadioAdvance();
+				var token = radioAdvanceTokenRef.current;
+				return performRadioAdvance(token);
+			};
+			React.useEffect(function () {
+				var radio = state && state.recommendation && state.recommendation.radio;
+				if (!radio || !radio.active) cancelRadioAdvance();
+			}, [state && state.recommendation && state.recommendation.radio && state.recommendation.radio.active]);
+			React.useEffect(function () { return cancelRadioAdvance; }, [cancelRadioAdvance]);
 
 			// 单飞自适应轮询：展开态及时，收起/隐藏/后台态降频；可见性变化立即同步一次。
 			React.useEffect(function () {
@@ -1556,7 +1605,7 @@ window.__ModuleLoader__.load({
 						try { audio.currentTime = 0; var rp = audio.play(); if (rp && typeof rp.catch === "function") rp.catch(function () {}); } catch { /* ignore */ }
 						return;
 					}
-					command("next").then(function () { setTimeout(refresh, 300); }).catch(function () {});
+					if (advancePlaybackRef.current) advancePlaybackRef.current();
 				});
 				audio.addEventListener("error", function () {
 					reporter.setPlaying(false);
@@ -1589,7 +1638,7 @@ window.__ModuleLoader__.load({
 					play: function () { mediaCommand("play"); },
 					pause: function () { mediaCommand("pause"); },
 					previoustrack: function () { mediaCommand("prev"); },
-					nexttrack: function () { mediaCommand("next"); },
+					nexttrack: function () { if (advancePlaybackRef.current) advancePlaybackRef.current(); },
 					seekto: function (d) {
 						if (seekToRef.current) seekToRef.current(d && typeof d.seekTime === "number" ? d.seekTime : 0);
 					}
@@ -1834,6 +1883,8 @@ window.__ModuleLoader__.load({
 
 			var runCommand = function (action) {
 				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
+				if (action === "next" && advancePlaybackRef.current) { advancePlaybackRef.current(); return; }
+				if (action === "playmode") cancelRadioAdvance();
 				command(action).then(function (r) {
 					if (r && r.ok === false) flash("err", r.error || "命令失败");
 					setTimeout(refresh, 400);
@@ -1864,6 +1915,7 @@ window.__ModuleLoader__.load({
 			// 推荐播放：不知道听什么时一键推荐
 			var onRecommend = function () {
 				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
+				cancelRadioAdvance();
 				var requestId = "recommend-" + Date.now() + "-" + (recommendRequestRef.current + 1);
 				recommendRequestRef.current = requestId;
 				setFavoritesOpen(false);
@@ -1913,6 +1965,7 @@ window.__ModuleLoader__.load({
 			// 播放全部或从收藏中的指定歌曲开始；收藏面板保持打开。
 			var playFavoritesFrom = function (index) {
 				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
+				cancelRadioAdvance();
 				setBusy(true);
 				queueApi({ action: "favorites", favoriteIndex: index || 0 }).then(function (r) {
 					setBusy(false);
@@ -1964,6 +2017,7 @@ window.__ModuleLoader__.load({
 
 			// 单击歌曲：追加到播放列表末尾并立即播放（不关闭搜索列表，可连续点播多首）
 			var onPlaySong = function (item) {
+				cancelRadioAdvance();
 				setBusy(true);
 				queueApi(queuePayloadForSearchItem(item)).then(function (r) {
 					if (!r || !r.ok) { setBusy(false); flash("err", (r && r.guidance) || (r && r.error) || "添加失败"); return; }
@@ -1980,6 +2034,7 @@ window.__ModuleLoader__.load({
 			};
 
 			var onAddSong = function (item) {
+				cancelRadioAdvance();
 				setBusy(true);
 				queueApi(queuePayloadForSearchItem(item)).then(function (r) {
 					setBusy(false);
@@ -1993,6 +2048,7 @@ window.__ModuleLoader__.load({
 			var onAddAll = function () {
 				var q = query.trim();
 				if (!q) return;
+				cancelRadioAdvance();
 				setBusy(true);
 				queueApi({ action: "add-all", keyword: q, limit: 30 }).then(function (r) {
 					if (!r || !r.ok) { setBusy(false); flash("err", (r && r.guidance) || (r && r.error) || "加入失败"); return; }
@@ -2014,6 +2070,7 @@ window.__ModuleLoader__.load({
 
 			// 单击歌单：整单追加到播放列表末尾并立即播放第一首（不关闭搜索列表）
 			var onPlayPlaylist = function (item) {
+				cancelRadioAdvance();
 				setBusy(true);
 				queueApi({ action: "playlist-add", playlistId: item.id }).then(function (r) {
 					if (!r || !r.ok) { setBusy(false); flash("err", (r && r.guidance) || (r && r.error) || "添加失败"); return; }
@@ -2031,6 +2088,7 @@ window.__ModuleLoader__.load({
 			};
 
 			var onAddPlaylist = function (item) {
+				cancelRadioAdvance();
 				setBusy(true);
 				queueApi({ action: "playlist-add", playlistId: item.id }).then(function (r) {
 					setBusy(false);
@@ -2065,6 +2123,7 @@ window.__ModuleLoader__.load({
 
 			// 清空播放列表
 			var onQueueClear = function () {
+				cancelRadioAdvance();
 				setBusy(true);
 				queueApi({ action: "clear" }).then(function (r) {
 					setBusy(false);
@@ -2527,7 +2586,7 @@ window.__ModuleLoader__.load({
 						!favoritesOpen && state && state.queue
 							? h("div", { className: "dsa-queue" }, [
 									h("div", { className: "dsa-queue-title", onClick: function () { setQueueOpen(!queueOpen); } }, [
-										h("span", null, "播放列表"),
+									h("span", null, state.recommendation && state.recommendation.radio && state.recommendation.radio.waitingForNextBatch ? "正在准备下一批…" : "播放列表"),
 										h("span", { className: "cnt" }, "(" + (state.queue.count || 0) + " 首)"),
 										h("span", { className: "fold" }, queueOpen ? "▾" : "▸")
 									]),
