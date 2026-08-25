@@ -106,6 +106,138 @@ test('state poller coalesces refreshes while one request is in flight', async ()
 	poller.stop();
 });
 
+test('state fetch timeout aborts a hung request so polling can recover', async () => {
+	const { fetchJsonWithTimeout } = loadClient();
+	const timers = [];
+	const cleared = [];
+	const pending = fetchJsonWithTimeout('/dsh-alger/state', { timeoutMs: 5000 }, {
+		AbortController,
+		fetch(_path, options) {
+			return new Promise((_resolve, reject) => {
+				options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+			});
+		},
+		setTimer(fn, delay) { timers.push({ fn, delay }); return timers.length; },
+		clearTimer(id) { cleared.push(id); }
+	});
+	assert.equal(timers[0].delay, 5000);
+	timers[0].fn();
+	await assert.rejects(() => pending, /request timeout/);
+	assert.deepEqual(cleared, [1]);
+});
+
+test('compact state signatures ignore object identity and collection reloads require an open stale panel', () => {
+	const { compactStateSignature, shouldReloadCollection } = loadClient();
+	const first = {
+		stateRevision: 3,
+		musicApiUp: true,
+		playing: { song: { id: 1, name: '晴天' }, isPlaying: true },
+		queue: { count: 60, index: 4, revision: 8 },
+		favorites: { count: 2, revision: 5 },
+		recommendation: { ready: true, count: 60, generating: false, lastError: null }
+	};
+	assert.equal(compactStateSignature(first), compactStateSignature(JSON.parse(JSON.stringify(first))));
+	assert.notEqual(compactStateSignature(first), compactStateSignature({ ...first, queue: { ...first.queue, revision: 9 } }));
+	assert.equal(shouldReloadCollection(null, 4, true), true);
+	assert.equal(shouldReloadCollection(4, 4, true), false);
+	assert.equal(shouldReloadCollection(4, 5, false), false);
+	assert.equal(shouldReloadCollection(4, 5, true), true);
+});
+
+test('virtual window renders every short row but bounds long collection work', () => {
+	const { virtualWindow } = loadClient();
+	assert.deepEqual({ ...virtualWindow(20, 500, 29, 205, 5, 50) }, {
+		virtualized: false, start: 0, end: 20, padTop: 0, padBottom: 0
+	});
+	assert.deepEqual({ ...virtualWindow(120, 580, 29, 205, 5, 50) }, {
+		virtualized: true, start: 15, end: 33, padTop: 435, padBottom: 2523
+	});
+});
+
+test('playback reporter sends on transitions and checkpoints only while active', async () => {
+	const { createPlaybackReporter } = loadClient();
+	let active = false;
+	let nextTimer = 0;
+	const timers = new Map();
+	const sent = [];
+	const reporter = createPlaybackReporter({
+		read: () => ({ playing: active, position: sent.length * 5 }),
+		send: async (payload) => { sent.push(payload); },
+		intervalMs: 5000,
+		setTimer(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
+		clearTimer(id) { timers.delete(id); }
+	});
+	active = true;
+	await reporter.setPlaying(true);
+	assert.equal(sent.length, 1);
+	assert.equal(timers.size, 1);
+	assert.equal([...timers.values()][0].delay, 5000);
+	await reporter.setPlaying(true);
+	assert.equal(sent.length, 1, 'repeated play events do not duplicate sends or timers');
+	assert.equal(timers.size, 1);
+
+	const [timerId, timer] = [...timers.entries()][0];
+	timers.delete(timerId);
+	timer.fn();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(sent.length, 2);
+	assert.equal(timers.size, 1, 'a periodic checkpoint schedules its successor after settling');
+	await reporter.checkpoint();
+	assert.equal(sent.length, 3);
+	assert.equal(timers.size, 1);
+
+	active = false;
+	await reporter.setPlaying(false);
+	assert.equal(sent.length, 4, 'pause is reported immediately');
+	assert.equal(timers.size, 0, 'paused playback has no periodic wakeup');
+	reporter.dispose();
+	assert.equal(timers.size, 0);
+});
+
+test('audio analyzer lifecycle samples only when enabled playing and visible', async () => {
+	const { createAnalyzerLifecycle } = loadClient();
+	let nextTimer = 0;
+	const timers = new Map();
+	const events = [];
+	const lifecycle = createAnalyzerLifecycle({
+		sample: () => ({ energy: 0.5 }),
+		onSample: (value) => events.push(['sample', value.energy]),
+		resume: async () => { events.push(['resume']); },
+		suspend: async () => { events.push(['suspend']); },
+		close: async () => { events.push(['close']); },
+		intervalMs: 800,
+		setTimer(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
+		clearTimer(id) { timers.delete(id); }
+	});
+	lifecycle.update({ enabled: true, playing: true, visible: true });
+	await Promise.resolve();
+	assert.deepEqual(events, [['resume']]);
+	assert.equal(timers.size, 1);
+	assert.equal([...timers.values()][0].delay, 800);
+	lifecycle.update({ enabled: true, playing: true, visible: true });
+	assert.equal(timers.size, 1, 'repeated active updates keep one sampler');
+
+	const [timerId, timer] = [...timers.entries()][0];
+	timers.delete(timerId);
+	timer.fn();
+	assert.deepEqual(events.at(-1), ['sample', 0.5]);
+	assert.equal(timers.size, 1);
+	lifecycle.update({ enabled: true, playing: false, visible: true });
+	await Promise.resolve();
+	assert.equal(timers.size, 0);
+	assert.deepEqual(events.at(-1), ['suspend']);
+	lifecycle.update({ enabled: true, playing: true, visible: false });
+	assert.equal(timers.size, 0);
+	lifecycle.update({ enabled: true, playing: true, visible: true });
+	await Promise.resolve();
+	assert.deepEqual(events.at(-1), ['resume']);
+	assert.equal(timers.size, 1);
+	lifecycle.dispose();
+	await Promise.resolve();
+	assert.equal(timers.size, 0);
+	assert.deepEqual(events.at(-1), ['close']);
+});
+
 test('moon phase clamps progress and fades only through the final eight percent', () => {
 	const { resolveMoonPhase } = loadClient();
 	assert.deepEqual(Object.values(resolveMoonPhase(-1)), [0, 1]);
@@ -192,6 +324,19 @@ test('favorite list keeps the compact play icon directly after the song count', 
 	assert.deepEqual(events, ['all', 'from:1']);
 });
 
+test('favorite list initially mounts only a bounded window for long collections', () => {
+	const { FavoriteListPanel } = loadClient();
+	const songs = Array.from({ length: 120 }, (_, index) => ({
+		id: index + 1, name: `歌曲${index + 1}`, artists: '歌手'
+	}));
+	const tree = FavoriteListPanel({ songs });
+	const rows = findNodes(tree, (node) => node.props?.className === 'dsa-favorite-row');
+	const spacer = findNodes(tree, (node) => node.props?.className === 'dsa-virtual-space')[0];
+	assert.equal(rows.length, 13, 'viewport plus overscan is mounted instead of all 120 rows');
+	assert.equal(spacer.props.style.height, 120 * 29);
+	assert.equal(rows[0].props.children[0].props.children, '1.');
+});
+
 test('favorite rows expose a lightweight remove control without starting playback', () => {
 	const { FavoriteListPanel } = loadClient();
 	const events = [];
@@ -224,6 +369,16 @@ test('queue song row exposes one lightweight remove control that does not select
 	assert.ok(remove);
 	remove.props.onClick({ stopPropagation() { events.push('stop'); } });
 	assert.deepEqual(events, ['stop', 'remove:2']);
+});
+
+test('queue list preserves original indices while virtualizing long queues', () => {
+	const { QueueListPanel } = loadClient();
+	const items = Array.from({ length: 120 }, (_, index) => ({ id: index + 1, name: `歌曲${index + 1}`, artists: '歌手' }));
+	const tree = QueueListPanel({ items, currentIndex: 87, selectedIndex: 90 });
+	const rows = findNodes(tree, (node) => typeof node.props?.className === 'string' && node.props.className.includes('dsa-qitem'));
+	assert.equal(rows.length, 10, '130px queue viewport mounts only its initial overscanned rows');
+	assert.equal(rows[0].props.children[0].props.children, '1.');
+	assert.equal(findNodes(tree, (node) => node.props?.className === 'dsa-virtual-space')[0].props.style.height, 120 * 28);
 });
 
 test('search rows add by their catalog song id', () => {

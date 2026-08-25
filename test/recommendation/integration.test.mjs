@@ -146,6 +146,115 @@ test('status exposes recommendation pool readiness without starting generation',
 	assert.equal(generationCalls, 0);
 });
 
+test('status health cache shares probes and uses adaptive success and failure TTLs', async () => {
+	let current = 1;
+	let calls = 0;
+	let releaseFirst;
+	const laterResults = [false, true];
+	const client = {
+		musicApiUp: async () => {
+			calls += 1;
+			if (calls === 1) return new Promise((resolve) => { releaseFirst = resolve; });
+			return laterResults.shift();
+		}
+	};
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		client, {}, createPlayer({ file: null }), {}, { recordPlayback: async () => {} },
+		{ now: () => current }
+	);
+	const first = actions.status();
+	const second = actions.status();
+	await Promise.resolve();
+	assert.equal(calls, 1, 'concurrent status reads share one health probe');
+	releaseFirst(true);
+	assert.equal((await first).musicApiUp, true);
+	assert.equal((await second).musicApiUp, true);
+
+	current = 60_000;
+	assert.equal((await actions.status()).musicApiUp, true);
+	assert.equal(calls, 1, 'a successful probe is cached for 60 seconds');
+
+	current = 60_002;
+	assert.equal((await actions.status()).musicApiUp, false);
+	assert.equal(calls, 2);
+	current = 65_001;
+	assert.equal((await actions.status()).musicApiUp, false);
+	assert.equal(calls, 2, 'a failed probe is cached for 5 seconds');
+	current = 65_003;
+	assert.equal((await actions.status()).musicApiUp, true);
+	assert.equal(calls, 3);
+});
+
+test('browser status is compact while model status retains collection details', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	player.toggleFavorite();
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} }
+	);
+	const compact = await actions.status({ compact: true });
+	assert.deepEqual(compact.queue, { count: 1, index: 0, revision: player.revisions().queueRevision });
+	assert.deepEqual(compact.favorites, { count: 1, revision: player.revisions().favoritesRevision });
+	assert.equal('favoriteIds' in compact, false);
+	const full = await actions.status();
+	assert.equal(full.queue.items.length, 1);
+	assert.deepEqual(full.favoriteIds, [1]);
+});
+
+test('state route requests compact status and queue-view exposes revisioned rows', async () => {
+	const routes = [];
+	const statusOptions = [];
+	registerRoutesForTest({ register: (route) => routes.push(route) }, {
+		status: async (options) => { statusOptions.push(options); return { ok: true, queue: { count: 2 } }; },
+		queueView: async () => ({ ok: true, revision: 4, count: 2, index: 0, items: [{ id: 1 }] })
+	});
+	const stateRes = response();
+	await routes.find((item) => item.path === '/dsh-alger/state').handler(request({}), stateRes);
+	assert.deepEqual(statusOptions, [{ compact: true }]);
+	assert.deepEqual(stateRes.body, { ok: true, queue: { count: 2 } });
+	const queueRes = response();
+	const queueRoute = routes.find((item) => item.path === '/dsh-alger/queue-view');
+	assert.ok(queueRoute);
+	await queueRoute.handler(request({}), queueRes);
+	assert.deepEqual(queueRes.body, { ok: true, revision: 4, count: 2, index: 0, items: [{ id: 1 }] });
+});
+
+test('action-level playback mutations invalidate compact player state', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} }
+	);
+	const before = player.revisions().stateRevision;
+	await actions.control({ action: 'pause' });
+	assert.equal(player.state.playing, false);
+	assert.equal(player.revisions().stateRevision, before + 1);
+});
+
+test('active playback records habits before checking night while paused reports skip the check', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	const events = [];
+	const shared = {};
+	const habits = {
+		async recordPlayback() { events.push('record'); },
+		async nightCheck() { events.push('night'); return { remind: true, nightSeconds: 7200 }; }
+	};
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, shared, player, {}, habits
+	);
+	await actions.playback({ position: 5, duration: 200, playing: true, ready: true });
+	assert.deepEqual(events, ['record', 'night']);
+	assert.match(shared.getNotice(), /夜深了/);
+	events.length = 0;
+	await actions.playback({ position: 5, duration: 200, playing: false, ready: true });
+	assert.deepEqual(events, ['record']);
+});
+
 test('strong preference signals schedule refresh while skip and completion only update history', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([
@@ -188,6 +297,21 @@ test('favorites route lists songs and removes one favorite without touching play
 	await route.handler(request({ action: 'remove', songId: 1 }), removeRes);
 	assert.deepEqual(calls, [1]);
 	assert.deepEqual(removeRes.body, { ok: true, removedId: 1, count: 0, songs: [] });
+});
+
+test('favorite list responses carry the revision that invalidates an open panel', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	player.toggleFavorite();
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} }
+	);
+	const listed = await actions.favoritesList();
+	assert.equal(listed.revision, player.revisions().favoritesRevision);
+	const removed = await actions.favoritesRemove({ songId: 1 });
+	assert.equal(removed.revision, player.revisions().favoritesRevision);
+	assert.ok(removed.revision > listed.revision);
 });
 
 test('favorite removal action updates only favorites and schedules preference refresh', async () => {
