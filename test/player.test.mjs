@@ -8,6 +8,107 @@ import { createPlayer } from '../lib/player.js';
 import { normalizeTrack } from '../lib/recommendation/identity.js';
 
 const song = (id, name) => ({ id, name, ar: [{ name: `歌手${id}` }] });
+const radioSong = (id, name) => ({ ...song(id, name), trackKey: `track-${id}` });
+
+test('recommendation radio replaces the whole queue and preserves favorites', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '手动一'), song(2, '手动二')]);
+	player.toggleFavorite();
+
+	const result = player.startRecommendationRadio(
+		[radioSong(30, '推荐一'), radioSong(31, '推荐二')],
+		'radio-1'
+	);
+
+	assert.deepEqual(player.state.queue.map((item) => item.name), ['推荐一', '推荐二']);
+	assert.equal(player.current().name, '推荐一');
+	assert.equal(player.state.playing, true);
+	assert.deepEqual(player.state.favorites.map((item) => item.id), [1]);
+	assert.equal(result.sessionId, 'radio-1');
+	assert.equal(result.batchNumber, 1);
+	assert.equal(result.count, 2);
+	assert.deepEqual(player.radioStatus().seenTrackKeys, ['track-30', 'track-31']);
+});
+
+test('recommendation radio replaces a completed batch and remembers every delivered track', () => {
+	const player = createPlayer({ file: null });
+	player.startRecommendationRadio([radioSong(30, '第一批一'), radioSong(31, '第一批二')], 'radio-1');
+	player.jump(1);
+	assert.equal(player.isRecommendationRadioBoundary(), true);
+
+	const result = player.replaceRecommendationRadioBatch([radioSong(40, '第二批一'), radioSong(41, '第二批二')]);
+
+	assert.deepEqual(player.state.queue.map((item) => item.name), ['第二批一', '第二批二']);
+	assert.equal(player.current().name, '第二批一');
+	assert.equal(result.batchNumber, 2);
+	assert.deepEqual(player.radioStatus().seenTrackKeys, ['track-30', 'track-31', 'track-40', 'track-41']);
+});
+
+test('recommendation radio survives restart with its batch cursor and waiting state', async (t) => {
+	const directory = mkdtempSync(join(tmpdir(), 'moony-radio-player-'));
+	t.after(() => rmSync(directory, { recursive: true, force: true }));
+	const file = join(directory, 'state.json');
+	const player = createPlayer({ file, saveDelayMs: 60000 });
+	player.startRecommendationRadio([radioSong(30, '推荐一'), radioSong(31, '推荐二')], 'radio-restart');
+	player.jump(1);
+	player.setRecommendationRadioWaiting(true);
+	await player.dispose();
+
+	const restored = createPlayer({ file });
+	assert.deepEqual(restored.state.queue.map((item) => item.name), ['推荐一', '推荐二']);
+	assert.equal(restored.state.index, 1);
+	assert.deepEqual(restored.radioStatus(), {
+		active: true,
+		sessionId: 'radio-restart',
+		batchNumber: 1,
+		seenTrackKeys: ['track-30', 'track-31'],
+		waitingForNextBatch: true
+	});
+});
+
+test('manual queue takeover exits recommendation radio while passive controls keep it active', () => {
+	const player = createPlayer({ file: null });
+	player.startRecommendationRadio([radioSong(30, '推荐一'), radioSong(31, '推荐二')], 'radio-takeover');
+	player.toggleFavorite();
+	player.jump(1);
+	assert.equal(player.radioStatus()?.active, true);
+
+	player.append([song(9, '手动加入')]);
+	assert.equal(player.radioStatus(), null);
+	assert.deepEqual(player.state.queue.map((item) => item.name), ['推荐一', '推荐二', '手动加入']);
+});
+
+test('every manual queue replacement path exits recommendation radio', () => {
+	const scenarios = [
+		['replaceAndPlay', (player) => player.replaceAndPlay([song(9, '手动')])],
+		['playSong', (player) => player.playSong(song(9, '手动'))],
+		['append', (player) => player.append([song(9, '手动')])],
+		['insertNext', (player) => player.insertNext([song(9, '手动')])],
+		['clearQueue', (player) => player.clearQueue()],
+		['playFavorites', (player) => {
+			player.toggleFavorite();
+			player.playFavorites();
+		}],
+		['togglePlayMode', (player) => player.togglePlayMode()]
+	];
+	for (const [name, takeOver] of scenarios) {
+		const player = createPlayer({ file: null });
+		player.startRecommendationRadio([radioSong(30, '推荐一'), radioSong(31, '推荐二')], `radio-${name}`);
+		takeOver(player);
+		assert.equal(player.radioStatus(), null, name);
+	}
+});
+
+test('batch-local controls do not exit recommendation radio', () => {
+	const player = createPlayer({ file: null });
+	player.startRecommendationRadio([radioSong(30, '推荐一'), radioSong(31, '推荐二')], 'radio-passive');
+	player.toggleFavorite();
+	player.jump(1);
+	player.togglePlay();
+	player.togglePlay();
+	player.removeQueueAt(0);
+	assert.equal(player.radioStatus()?.active, true);
+});
 
 test('recommendations insert after current without replacing manual songs', () => {
 	const player = createPlayer({ file: null });
