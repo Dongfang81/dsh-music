@@ -1665,14 +1665,15 @@ export function apply(ctx, config) {
 		registerRoutes(webServer, actions);
 	}
 	if (typeof ctx.on === 'function') {
-		ctx.on('dispose', () => {
+		ctx.on('dispose', async () => {
 			coordinator?.cancel('plugin disposed');
 			recommendationScheduler?.dispose();
-			habits.flush().catch(() => {});
 			for (const dispose of disposers) dispose();
-			if (apiHandle && apiHandle.handle) {
-				stopApiServer(apiHandle.handle).catch(() => {});
-			}
+			await Promise.allSettled([
+				player.dispose(),
+				habits.flush(),
+				apiHandle && apiHandle.handle ? stopApiServer(apiHandle.handle) : Promise.resolve()
+			]);
 		});
 	}
 }

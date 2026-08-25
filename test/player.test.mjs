@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -86,6 +86,26 @@ test('favorites stay as one flat list when loading state written by the collecti
 	assert.equal(player.state.favoriteCollections, undefined);
 	assert.equal(player.snapshot().favoriteCollections, undefined);
 	assert.equal(player.playFavorites().count, 2);
+});
+
+test('player flush atomically persists the latest debounced state before shutdown', async (t) => {
+	const directory = mkdtempSync(join(tmpdir(), 'moony-player-flush-'));
+	t.after(() => rmSync(directory, { recursive: true, force: true }));
+	const file = join(directory, 'state.json');
+	const player = createPlayer({ file, saveDelayMs: 60000 });
+
+	player.replaceAndPlay([song(1, '晴天')]);
+	player.toggleFavorite();
+	player.volumeDown();
+	assert.equal(existsSync(file), false, 'the long debounce keeps disk I/O off the mutation path');
+	await player.dispose();
+
+	const saved = JSON.parse(readFileSync(file, 'utf8'));
+	assert.deepEqual(saved.queue.map((item) => item.id), [1]);
+	assert.deepEqual(saved.favorites.map((item) => item.id), [1]);
+	assert.equal(saved.volume, 0.7);
+	assert.equal(typeof saved.at, 'number');
+	assert.equal(typeof player.flush, 'function');
 });
 
 test('playing favorites from one row keeps the full favorite list as playback context', () => {
