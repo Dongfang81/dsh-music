@@ -32,13 +32,15 @@ import { createClient } from './lib/alger.js';
 import { createPlayer } from './lib/player.js';
 import { createHabits } from './lib/habits.js';
 import { startApiServer, stopApiServer } from './lib/api-server.js';
-import { matchSourceUrl, matchSourceByKeyword, safeCrossSourceDuration } from './lib/source-match.js';
 import { normalizeTrack } from './lib/recommendation/identity.js';
 import { createTasteProfile } from './lib/recommendation/profile.js';
 import { createLocalLibrary } from './lib/recommendation/local-library.js';
 import { createRetrievers } from './lib/recommendation/retrievers.js';
 import { createSourceResolver } from './lib/recommendation/source-resolver.js';
 import { createRecommendationCoordinator } from './lib/recommendation/coordinator.js';
+import { createRecommendationPool } from './lib/recommendation/pool.js';
+import { createRecommendationGenerator } from './lib/recommendation/generator.js';
+import { createRecommendationScheduler } from './lib/recommendation/scheduler.js';
 
 export const name = '@dongfang81/dsh-music';
 export const inject = ['subprocess', 'tools', 'webServer'];
@@ -56,6 +58,7 @@ const DEFAULTS = {
 	timeoutMs: 20000,
 	localMusicPaths: [],
 	recommendationLearning: true,
+	// 旧版兼容字段：后台池上线后不再向用户展示，旧配置仍可安全读取。
 	recommendationTargetSize: 15
 };
 
@@ -156,11 +159,16 @@ function normalize(s) {
 function buildActions(cfg, client, shared, player, apiHandle, habits, recommendation = {}) {
 	const coordinator = recommendation.coordinator ?? null;
 	const preference = recommendation.preference ?? null;
-	const matchByKeyword = recommendation.matchSourceByKeyword ?? matchSourceByKeyword;
-	const feedback = (type, song) => {
-		if (!cfg.recommendationLearning || !coordinator || !song) return;
-		const track = song.trackKey ? song : normalizeTrack(song, 'player');
-		if (track) coordinator.feedback({ type, track }).catch(() => {});
+	const pool = recommendation.pool ?? null;
+	const scheduler = recommendation.scheduler ?? null;
+	const now = typeof recommendation.now === 'function' ? recommendation.now : Date.now;
+	const refreshSignals = new Set(['favorite', 'unfavorite', 'search-play']);
+	const feedback = async (type, song) => {
+		if (cfg.recommendationLearning && coordinator && song) {
+			const track = song.trackKey ? song : normalizeTrack(song, 'player');
+			if (track) await coordinator.feedback({ type, track }).catch(() => {});
+		}
+		if (refreshSignals.has(type)) scheduler?.schedule(type);
 	};
 	// 宠物台词/通知（agent → 宠物气泡，约 6 秒）
 	const noticeStore = { text: '', until: 0 };
@@ -170,14 +178,21 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 	};
 	shared.getNotice = () => (noticeStore.until > Date.now() ? noticeStore.text : null);
 
-	// 音乐服务是否在线（2s 探活缓存）
-	let apiUpCache = { value: false, at: 0 };
+	// 音乐服务是否在线：成功长缓存、失败短缓存；并发状态读取共享一次探活。
+	let apiUpCache = { value: false, at: 0, valid: false };
+	let apiUpPending = null;
 	async function apiUp() {
-		if (Date.now() - apiUpCache.at < 2000) return apiUpCache.value;
-		const up = await client.musicApiUp();
-		apiUpCache = { value: up, at: Date.now() };
-		if (apiHandle) apiHandle.isUp = up;
-		return up;
+		const ttl = apiUpCache.value ? 60_000 : 5_000;
+		if (apiUpCache.valid && now() - apiUpCache.at < ttl) return apiUpCache.value;
+		if (apiUpPending) return apiUpPending;
+		apiUpPending = Promise.resolve(client.musicApiUp({ timeoutMs: 1000 }))
+			.then((up) => {
+				apiUpCache = { value: Boolean(up), at: now(), valid: true };
+				if (apiHandle) apiHandle.isUp = Boolean(up);
+				return Boolean(up);
+			})
+			.finally(() => { apiUpPending = null; });
+		return apiUpPending;
 	}
 
 	/** 原始关键词 → 拆成「歌名 - 歌手」（支持「歌手 歌名」/「歌名 歌手」/「歌名-歌手」）。 */
@@ -195,12 +210,8 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		return { name: s, artist: '' };
 	}
 
-	/** 取歌曲直链（多级兜底）：
-	 *  1) 音乐 API 直链（有版权且歌手与关键词一致时，避免命中翻唱版的直链）；
-	 *  2) 歌曲元数据从其他平台匹配（仅当关键词歌手与歌曲一致时）；
-	 *  3) 原始关键词匹配（网易云下架/列表只有翻唱时，按「歌名 - 歌手」拿原版音源）。
-	 *  返回 { url, displayName? }；displayName 为关键词匹配到的原版标题（与列表歌名不同时提供）；
-	 *  无法播放返回 null。 */
+	/** 取歌曲直链：只接受主音乐 API 已确认歌曲身份的官方直链。
+	 * 第三方关键词跨源匹配暂时熔断，避免把翻唱、伴奏或个人上传冒充原唱。 */
 	async function urlFor(song, keyword) {
 		if (song?.resolvedUrl) return { url: song.resolvedUrl };
 		const kw = String(keyword || '').trim();
@@ -222,59 +233,23 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				/* 继续兜底 */
 			}
 		}
-		// 2) 歌曲元数据 → 多平台匹配（歌手一致才用，避免匹配到翻唱版）
-		if (song && song.name && consistent) {
-			try {
-				const url = await matchSourceUrl(song);
-				if (url) return { url };
-			} catch {
-				/* 继续兜底 */
-			}
-		}
-		// 3) 原始关键词 → 多平台匹配（覆盖网易云下架/翻唱场景，按「歌名 - 歌手」拿原版）
-		if (kw) {
-			try {
-				// 只有标题和歌手 token 都精确匹配时才借用候选时长；翻唱/部分命中必须传 0。
-				const duration = safeCrossSourceDuration({
-					title: song?.name,
-					artists: song?.ar ?? song?.artists,
-					durationMs: song?.dt
-				}, { title: parts.name, artists: parts.artist ? [parts.artist] : [] });
-				const hit = await matchByKeyword(parts.name || kw, parts.artist, null, duration);
-				if (hit && hit.url) {
-					// 关键词匹配到的是原版：显示名用「匹配标题 + 关键词歌手」，替换列表里的翻唱信息
-					const listName = song && song.name ? String(song.name).trim() : '';
-					const hitName = hit.title ? String(hit.title).trim() : parts.name || '';
-					const artistName = parts.artist || '';
-					const listArtist = songArtists || '';
-					const sameName = !listName || hitName === listName;
-					const sameArtist = !artistName || !listArtist || listArtist.includes(artistName) || artistName.includes(listArtist.split(/\s+/)[0] || '');
-					// 歌名或歌手任一与列表不一致 → 带上 displayName（「歌名 - 歌手」格式）与结构化信息
-					if (!sameName || !sameArtist) {
-						return {
-							url: hit.url,
-							displayName: artistName ? hitName + ' - ' + artistName : hitName,
-							matchTitle: hitName,
-							matchArtist: artistName
-						};
-					}
-					return { url: hit.url };
-				}
-			} catch {
-				/* 返回 null */
-			}
-		}
 		return null;
 	}
 
 	return {
 		/** alger_status */
-		async status() {
-			const musicApiUp = await apiUp();
-			const snap = player.snapshot();
+		async status(options = {}) {
+			const compact = Boolean(options.compact);
+			const [musicApiUp, poolState] = await Promise.all([
+				apiUp(),
+				pool ? pool.status().catch(() => null) : Promise.resolve(null)
+			]);
+			const schedulerState = scheduler?.status?.() ?? null;
+			const snap = player.snapshot({ includeQueue: !compact, includeFavoriteIds: !compact });
 			return {
 				ok: true,
 				musicApiUp,
+				stateRevision: snap.stateRevision,
 				playing: snap.playing
 					? { ok: true, isPlaying: snap.isPlaying, song: snap.playing }
 					: null,
@@ -282,17 +257,27 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					? { position: snap.position, duration: snap.duration, playing: snap.isPlaying }
 					: null,
 				favorite: snap.favorite,
-				favoriteIds: snap.favoriteIds,
+				...(compact ? {} : { favoriteIds: snap.favoriteIds }),
 				favoriteCount: snap.favoriteCount,
-				favoriteCollections: snap.favoriteCollections,
+				favorites: snap.favorites,
 				playMode: snap.playMode,
 				volume: snap.volume,
 				currentUrl: snap.currentUrl,
 				ready: snap.ready,
 				notice: shared.getNotice ? shared.getNotice() : null,
 				agentStatus: shared.getAgentStatus ? shared.getAgentStatus() : 'idle',
+				recommendation: {
+					ready: Boolean(poolState?.ready),
+					count: Number(poolState?.count ?? poolState?.items?.length) || 0,
+					generating: Boolean(schedulerState?.generating || schedulerState?.scheduled),
+					lastError: schedulerState?.lastError ?? null
+				},
 				queue: snap.queue
 			};
+		},
+
+		async queueView() {
+			return { ok: true, ...player.queueView() };
 		},
 
 		/** alger_say：让宠物开口说一句话（气泡提示约 6 秒） */
@@ -303,13 +288,35 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			return { ok: true, text };
 		},
 
-		/** 按钮/明确工具请求的快速推荐：本地协调器直接执行，不经过 LLM。 */
-		async recommend(args) {
+		/** 按钮/明确工具请求的快速推荐：只消费后台准备好的推荐池。 */
+		async recommend(_args) {
 			if (!(await apiUp())) return { ok: false, guidance: '音乐服务尚未就绪，当前播放和队列保持不变。' };
-			if (!coordinator) return { ok: false, guidance: '推荐模块未能初始化，当前播放和队列保持不变。' };
-			const result = await coordinator.recommend(asRecord(args));
-			if (result.ok) shared.setNotice(`♫ 已为你接上 ${result.tracks.length} 首，当前这首继续播`);
-			return result;
+			if (!pool) return { ok: false, preparing: true, guidance: '推荐池尚未初始化，请稍后再试。' };
+			const consumed = await pool.consume(30);
+			if (!consumed.ok) {
+				scheduler?.schedule('cold-start', { urgent: true });
+				return { ok: false, preparing: true, count: 0, remaining: consumed.remaining, guidance: '推荐正在准备中，请稍后再试。' };
+			}
+			try {
+				player.insertRecommendationAfterCurrent(consumed.tracks, 'button-recommendation', {
+					playFirst: true,
+					replaceUnplayed: false
+				});
+				const hit = await urlFor(player.current());
+				player.updatePlayback({ currentUrl: hit ? hit.url : null, playing: Boolean(hit) });
+				await pool.commit(consumed.transaction);
+			} catch (error) {
+				await pool.restore(consumed.transaction).catch(() => {});
+				throw error;
+			}
+			if (consumed.remaining <= 30) scheduler?.schedule('low-watermark', { urgent: true });
+			return {
+				ok: true,
+				insertMode: 'after-current-and-play',
+				count: consumed.tracks.length,
+				tracks: consumed.tracks,
+				remaining: consumed.remaining
+			};
 		},
 
 		/** alger_setup：内置音乐服务管理 */
@@ -365,34 +372,22 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const limit = Math.min(50, Math.max(1, Number(args?.limit) || 10));
 			const result = await client.search(keywords, type, limit);
 			let items = [];
+			let guidance;
 			if (type === 1) {
 				items = (result.songs || []).map((s) => compactSong(s));
-				// 网易云单源搜不到/全是翻唱（歌手不精确命中）时，用跨源聚合补「真原版」（如周杰伦）。
-				// 只在「带歌手的关键词」且网易云结果里没有该歌手精确条目时补一条，避免常规搜索被污染。
-				try {
-					const kParts = splitKeyword(keywords);
-					const exactArtist = String(kParts.artist || '').trim().toLowerCase();
-					const hasExactArtist = exactArtist && items.some((it) =>
-						String(it.artists || '').split(/[\/\s，,、]+/).some((t) => t.trim().toLowerCase() === exactArtist)
-					);
-					if (exactArtist && !hasExactArtist) {
-						const hit = await matchByKeyword(kParts.name || keywords, kParts.artist, null, 0);
-						if (hit && hit.url) {
-							items.unshift({
-								id: 0,
-								name: hit.title || kParts.name || keywords,
-								artists: kParts.artist,
-								album: '',
-								durationMs: null,
-								picUrl: '',
-								source: hit.source || '',
-								crossSource: true,
-								playKeyword: keywords,
-								desc: (hit.source || '跨源') + ' · 原版，点歌用「' + (kParts.name || keywords) + ' ' + kParts.artist + '」'
-							});
-						}
+				const requested = splitKeyword(keywords);
+				if (requested.artist) {
+					const title = normalize(requested.name);
+					const artist = normalize(requested.artist);
+					items = items.filter((item) => {
+						const exactTitle = normalize(item.name) === title;
+						const artistNames = String(item.artists || '').split(/[\/，,、;&；]+/).map(normalize).filter(Boolean);
+						return exactTitle && artistNames.includes(artist);
+					});
+					if (items.length === 0) {
+						guidance = `没有找到歌手和歌名都完全匹配「${requested.artist} - ${requested.name}」的可靠原唱。`;
 					}
-				} catch { /* 跨源搜索失败不影响主结果 */ }
+				}
 			} else if (type === 10) {
 				items = (result.albums || []).map((a) => ({
 					id: a.id,
@@ -414,7 +409,23 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					desc: (m.artists || []).map((x) => x.name).join('/')
 				}));
 			}
-			return { ok: true, keyword: keywords, type, total: items.length, items };
+			return { ok: true, keyword: keywords, type, total: items.length, items, ...(guidance ? { guidance } : {}) };
+		},
+
+		/** 浏览器收藏面板：只暴露一个扁平收藏列表，不承担目录或整理功能。 */
+		async favoritesList() {
+			const songs = player.state.favorites.map(compactSong);
+			return { ok: true, revision: player.revisions().favoritesRevision, count: songs.length, songs };
+		},
+
+		/** 从扁平收藏列表取消一首收藏，不影响当前播放上下文。 */
+		async favoritesRemove(args) {
+			const songId = Number(args?.songId);
+			if (!Number.isFinite(songId)) throw new Error('请提供有效的歌曲 id。');
+			const result = player.removeFavorite(songId);
+			if (result.removed) await feedback('unfavorite', result.removed);
+			const songs = player.state.favorites.map(compactSong);
+			return { ok: true, revision: player.revisions().favoritesRevision, removedId: result.removed ? Number(result.removed.id) : null, count: songs.length, songs };
 		},
 
 		/** alger_song */
@@ -488,6 +499,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		/** 播放进度上报（浮动窗口 <audio> 定时上报） */
 		async playback(args) {
 			const value = asRecord(args);
+			const activePlayback = Boolean(value.playing) && Boolean(player.state.playing);
 			player.reportPlayback({
 				position: Number(value.position) || 0,
 				duration: Number(value.duration) || 0,
@@ -498,7 +510,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			try {
 				const song = player.state.queue[player.state.index] || null;
 				if (song && song.id) {
-					habits.recordPlayback({
+					await habits.recordPlayback({
 						song: {
 							id: song.id,
 							name: song.name,
@@ -507,8 +519,12 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 						},
 						position: Number(value.position) || 0,
 						duration: Number(value.duration) || 0,
-						playing: Boolean(player.state.playing)
-					}).catch(() => {});
+						playing: activePlayback
+					});
+					if (activePlayback && typeof habits.nightCheck === 'function') {
+						const night = await habits.nightCheck();
+						if (night?.remind) shared.setNotice('🌙 夜深了，早点休息～月宝儿先退下啦', 8000);
+					}
 				}
 			} catch {
 				/* 忽略 */
@@ -558,7 +574,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				throw new Error('请提供 keyword 或 songId（二选一）。');
 			}
 
-			// 2) 确认可播放（多级兜底：网易云直链 → 元数据匹配 → 原始关键词匹配）
+			// 2) 确认可播放（只接受主音乐 API 对当前歌曲返回的直链）
 			const hit = await urlFor(song, keyword);
 			if (!hit) {
 				return {
@@ -570,18 +586,9 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const url = hit.url;
 
 			// 3) 写入播放状态（客户端轮询到 currentUrl 后自动播放）
-			// 关键词匹配到原版时，歌曲信息修正为「原版标题 - 歌手」（如 A-LNK 版 → 晴天 - 周杰伦）
-			if (hit.matchTitle) {
-				song = {
-					...song,
-					name: hit.matchTitle,
-					ar: hit.matchArtist ? [{ id: 0, name: hit.matchArtist }] : (song.ar || []),
-					artists: hit.matchArtist ? [{ id: 0, name: hit.matchArtist }] : (song.artists || [])
-				};
-			}
 			player.playSong(song);
-			player.state.currentUrl = url;
-			feedback('search-play', song);
+			player.updatePlayback({ currentUrl: url });
+			await feedback('search-play', song);
 			shared.setNotice('♪ 已播放：' + song.name);
 			return { ok: true, steps, playedName: song.name, playedId: song.id, confirmed: true };
 		},
@@ -598,8 +605,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				const result = player.removeQueueAt(args?.index);
 				if (result.currentChanged && result.current) {
 					const hit = await urlFor(result.current);
-					player.state.currentUrl = hit ? hit.url : null;
-					if (!hit) player.state.playing = false;
+					player.updatePlayback({ currentUrl: hit ? hit.url : null, ...(hit ? {} : { playing: false }) });
 				}
 				return {
 					ok: true,
@@ -630,14 +636,17 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 
 			// 播放收藏列表：整单替换队列并播放第一首
 			if (action === 'favorites') {
-				const fv = player.playFavorites();
+				const requestedIndex = args?.favoriteIndex === undefined ? 0 : Number(args.favoriteIndex);
+				if (!Number.isInteger(requestedIndex) || requestedIndex < 0 || requestedIndex >= player.state.favorites.length) {
+					if (player.state.favorites.length > 0) throw new Error('favoriteIndex 需要是收藏列表内有效的 0 起整数。');
+				}
+				const fv = player.playFavorites(requestedIndex);
 				if (!fv.song) {
 					return { ok: false, steps: [...steps, '收藏列表为空'], guidance: '先点心形按钮收藏几首歌，再回来点“收藏”播放。' };
 				}
 				log(`收藏列表 ${fv.count} 首，从「${fv.song.name}」开始播放`);
 				const hit = await urlFor(fv.song);
-				player.state.currentUrl = hit ? hit.url : null;
-				player.state.playing = true;
+				player.updatePlayback({ currentUrl: hit ? hit.url : null, playing: true });
 				return { ok: true, steps, mode: 'favorites', added: fv.count, queueLength: player.state.queue.length, playedName: fv.song.name };
 			}
 
@@ -695,8 +704,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				const song = player.jump(idx);
 				const hit = await urlFor(song);
 				if (!hit) return { ok: false, steps: [...steps, `「${song.name}」暂无可用播放地址`], guidance: '换一首试试。' };
-				player.state.currentUrl = hit.url;
-				player.state.playing = true;
+				player.updatePlayback({ currentUrl: hit.url, playing: true });
 				return { ok: true, steps, mode: 'jump', playedName: song ? song.name : '', queueLength: player.state.queue.length };
 			} else {
 				// add-all：整批搜索结果加入
@@ -713,8 +721,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			if (mode === 'replace') {
 				const song = player.replaceAndPlay(songs);
 				const hit = await urlFor(song);
-				player.state.currentUrl = hit ? hit.url : null;
-				player.state.playing = true;
+				player.updatePlayback({ currentUrl: hit ? hit.url : null, playing: true });
 				shared.setNotice('♫ 整单播放：' + (song ? song.name : '') + '（' + songs.length + ' 首）');
 				return { ok: true, steps, mode, added: songs.length, queueLength: player.state.queue.length, playedName: song ? song.name : null };
 			}
@@ -726,51 +733,6 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const n = player.append(songs);
 			shared.setNotice('＋ 已加入播放列表 ' + songs.length + ' 首');
 			return { ok: true, steps, mode, added: songs.length, queueLength: n, playedName: null };
-		},
-
-		/** 收藏集整理：全局收藏仍只由红心 toggle-favorite 控制。 */
-		async favorites(args) {
-			const action = String(args?.action ?? 'list');
-			if (action === 'list') {
-				const collection = player.favoriteCollection(String(args?.collectionId || 'all'));
-				return {
-					ok: true,
-					collections: player.listFavoriteCollections(),
-					collection: { id: collection.id, name: collection.name, count: collection.count, system: Boolean(collection.system) },
-					songs: collection.songs.map(compactSong)
-				};
-			}
-			if (action === 'create') {
-				return { ok: true, collection: player.createFavoriteCollection(args?.name), collections: player.listFavoriteCollections() };
-			}
-			if (action === 'rename') {
-				return { ok: true, collection: player.renameFavoriteCollection(args?.collectionId, args?.name), collections: player.listFavoriteCollections() };
-			}
-			if (action === 'delete') {
-				player.deleteFavoriteCollection(args?.collectionId);
-				return { ok: true, deleted: String(args?.collectionId), collections: player.listFavoriteCollections() };
-			}
-			if (action === 'set-memberships') {
-				const songId = Number(args?.songId);
-				if (!player.isFavorite(songId)) {
-					const current = player.current();
-					if (!current || Number(current.id) !== songId) throw new Error('只能整理已收藏歌曲或当前播放歌曲');
-					player.toggleFavorite();
-					feedback('favorite', current);
-				}
-				const collectionIds = player.setFavoriteMemberships(songId, args?.collectionIds);
-				return { ok: true, songId, collectionIds, collections: player.listFavoriteCollections() };
-			}
-			if (action === 'play') {
-				const result = player.playFavoriteCollection(String(args?.collectionId || 'all'));
-				if (!result.song) return { ok: false, guidance: '这个收藏集还是空的。' };
-				const hit = await urlFor(result.song);
-				if (!hit) return { ok: false, guidance: '收藏集第一首暂时没有可用播放地址。' };
-				player.state.currentUrl = hit.url;
-				player.state.playing = true;
-				return { ok: true, collection: result.collection, added: result.count, queueLength: player.state.queue.length, playedName: result.song.name };
-			}
-			throw new Error('action 需为 list / create / rename / delete / set-memberships / play');
 		},
 
 		/** alger_control：播放控制（内置状态机） */
@@ -785,21 +747,20 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				if (player.state.playing === wantPlay) {
 					return { action, message: `当前已是${wantPlay ? '播放' : '暂停'}状态，无需操作` };
 				}
-				player.state.playing = wantPlay;
+				player.updatePlayback({ playing: wantPlay });
 				return { action, message: wantPlay ? '已播放' : '已暂停', playing: player.state.playing };
 			}
 			if (action === 'next' || action === 'prev') {
 				const leaving = player.current();
 				if (action === 'next' && leaving) {
-					if (player.state.position > 0 && player.state.position < 20) feedback('skip-short', leaving);
-					else if (player.state.duration > 0 && player.state.position / player.state.duration >= 0.8) feedback('complete-80', leaving);
+					if (player.state.position > 0 && player.state.position < 20) await feedback('skip-short', leaving);
+					else if (player.state.duration > 0 && player.state.position / player.state.duration >= 0.8) await feedback('complete-80', leaving);
 				}
 				const song = action === 'next' ? player.next() : player.prev();
 				if (!song) throw new Error('队列为空，无法切换。');
 				const hit = await urlFor(song);
 				if (!hit) throw new Error(`「${song.name}」暂无可用播放地址。`);
-				player.state.currentUrl = hit.url;
-				player.state.playing = true;
+				player.updatePlayback({ currentUrl: hit.url, playing: true });
 				return { action, message: '已切到：' + song.name, song: song.name, playing: true };
 			}
 			if (action === 'volume-up' || action === 'volume-down') {
@@ -808,7 +769,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			}
 			if (action === 'toggle-favorite') {
 				const r = player.toggleFavorite();
-				if (r.favorite) feedback('favorite', player.current());
+				await feedback(r.favorite ? 'favorite' : 'unfavorite', player.current());
 				return { action, message: r.favorite ? '已收藏' : '已取消收藏', favorite: r.favorite };
 			}
 			if (action === 'playmode') {
@@ -821,7 +782,10 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		/** 仅供明确的长期偏好指令使用；普通对话不会自动写入。 */
 		async preference(args) {
 			if (!preference) throw new Error('偏好档案未初始化');
-			return preference(asRecord(args));
+			const value = asRecord(args);
+			const result = await preference(value);
+			if (String(value.action || 'summary') !== 'summary') scheduler?.schedule('preference');
+			return result;
 		},
 
 		/** alger_habits：听歌记忆（查看/清空本地播放习惯，纯本地不上传） */
@@ -1162,14 +1126,14 @@ function buildTools(cfg, actions) {
 	const recommend = {
 		name: 'alger_recommend',
 		description:
-			'仅在用户明确要求立即推荐、直接播放或“来一批歌”时调用。按钮式快速推荐会保留当前歌曲并把结果接在后面；如果用户只是在表达情绪、犹豫或闲聊，应先自然回应、提供情绪价值和想法，不要为了结构化而自动搜索或急着给结果。',
+			'仅在用户明确要求立即推荐、直接播放或“来一批歌”时调用。按钮式快速推荐会把完整一批歌曲加入播放列表，并从第一首推荐开始播放；如果用户只是在表达情绪、犹豫或闲聊，应先自然回应、提供情绪价值和想法，不要为了结构化而自动搜索或急着给结果。',
 		parameters: compileParameters({}),
 		output: {
 			schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
 			render: (_args, value) => {
 				const rec = asRecord(value);
 				const lines = [];
-				if (rec.ok) lines.push('♫ 已接上 ' + ((rec.tracks || []).length || 0) + ' 首推荐，当前歌曲保持不变。');
+				if (rec.ok) lines.push('♫ 已加入 ' + ((rec.tracks || []).length || 0) + ' 首推荐，并开始播放本批第一首。');
 				if (rec.guidance) lines.push('提示: ' + rec.guidance);
 				return textBlock(lines);
 			}
@@ -1298,7 +1262,18 @@ function registerRoutes(webServer, actions) {
 			path: '/dsh-alger/state',
 			handler: async (_req, res) => {
 				try {
-					json(res, await actions.status());
+					json(res, await actions.status({ compact: true }));
+				} catch (error) {
+					json(res, { ok: false, error: String((error && error.message) || error) });
+				}
+			}
+		},
+		{
+			kind: 'exact',
+			path: '/dsh-alger/queue-view',
+			handler: async (_req, res) => {
+				try {
+					json(res, await actions.queueView());
 				} catch (error) {
 					json(res, { ok: false, error: String((error && error.message) || error) });
 				}
@@ -1373,7 +1348,7 @@ function registerRoutes(webServer, actions) {
 			handler: async (req, res) => {
 				try {
 					const body = JSON.parse((await readBody(req)) || '{}');
-					json(res, await actions.favorites(body));
+					json(res, body.action === 'remove' ? await actions.favoritesRemove(body) : await actions.favoritesList());
 				} catch (error) {
 					json(res, { ok: false, error: String((error && error.message) || error) });
 				}
@@ -1511,6 +1486,9 @@ export function apply(ctx, config) {
 	let localLibrary = null;
 	let sourceResolver = null;
 	let coordinator = null;
+	let recommendationPool = null;
+	let recommendationGenerator = null;
+	let recommendationScheduler = null;
 	try {
 		tasteProfile = createTasteProfile({ file: join(dataRoot, 'moony-singer-recommendation.json') });
 		if (cfg.recommendationLearning) {
@@ -1537,44 +1515,63 @@ export function apply(ctx, config) {
 					confidence: 1
 				} : null;
 			} : null,
-			direct: async (track) => {
+			direct: async (track, options = {}) => {
 				const id = Number(track?.raw?.id);
 				if (!id) return null;
-				const url = await client.songUrl(id, 'higher');
+				const url = await client.songUrl(id, 'higher', { signal: options.signal });
 				return url ? { url, sourceKey: 'netease', confidence: 1, expiresAt: Date.now() + 4 * 60 * 1000 } : null;
 			},
-			cross: async (track, options) => {
-				const requested = options?.requested;
-				const title = requested?.title ?? track.title;
-				const artist = requested?.artists?.[0] ?? track.artists?.[0] ?? '';
-				const hit = await matchSourceByKeyword(title, artist, null, options?.durationMs ?? 0);
-				return hit ? {
-					url: hit.url,
-					sourceKey: hit.source || 'cross-source',
-					confidence: 0.95,
-					matchedIdentity: requested ?? track,
-					expiresAt: Date.now() + 4 * 60 * 1000
-				} : null;
-			}
 		});
 	} catch (error) {
 		console.warn('[dsh-moony-singer] 音源解析器初始化失败: ' + ((error && error.message) || String(error)));
 	}
 	try {
 		if (tasteProfile && sourceResolver) {
+			const retrievers = createRetrievers({ client, localLibrary, timeoutMs: Math.min(cfg.timeoutMs, 3500) });
 			coordinator = createRecommendationCoordinator({
 				player,
 				profile: tasteProfile,
 				client,
 				localLibrary,
-				retrievers: createRetrievers({ client, localLibrary, timeoutMs: Math.min(cfg.timeoutMs, 3500) }),
+				retrievers,
 				resolver: sourceResolver,
 				targetSize: Math.max(1, Math.min(30, Number(cfg.recommendationTargetSize) || 15)),
 				timeoutMs: Math.max(3000, Number(cfg.timeoutMs) || 20000)
 			});
+			recommendationPool = createRecommendationPool({
+				file: join(dataRoot, 'moony-singer-recommendation-pool.json'),
+				targetSize: 60,
+				batchSize: 30,
+				historySize: 120
+			});
+			recommendationGenerator = createRecommendationGenerator({
+				pool: recommendationPool,
+				player,
+				profile: tasteProfile,
+				client,
+				localLibrary,
+				retrievers,
+				resolver: sourceResolver,
+				targetSize: 60
+			});
+			recommendationScheduler = createRecommendationScheduler({
+				debounceMs: 10000,
+				retryDelayMs: 30000,
+				generate: async (input) => {
+					const result = await recommendationGenerator.generate(input);
+					if (!result.ok) throw new Error(result.error || result.reason || '推荐池生成失败');
+					return result;
+				}
+			});
+			recommendationPool.load().then(() => {
+				if (recommendationPool.needsRefill()) recommendationScheduler.schedule('startup', { urgent: true });
+			}).catch((error) => {
+				console.warn('[dsh-moony-singer] 推荐池加载失败: ' + ((error && error.message) || String(error)));
+				recommendationScheduler.schedule('startup-recovery', { urgent: true });
+			});
 		}
 	} catch (error) {
-		console.warn('[dsh-moony-singer] 推荐协调器初始化失败: ' + ((error && error.message) || String(error)));
+		console.warn('[dsh-moony-singer] 推荐系统初始化失败: ' + ((error && error.message) || String(error)));
 	}
 
 	// 内置音乐 API 服务（netease-cloud-music-api-alger）自动启动
@@ -1642,8 +1639,8 @@ export function apply(ctx, config) {
 		const now = Date.now();
 		let best = 'idle';
 		let bestT = -Infinity;
-		for (const e of agentState.values()) {
-			if (now - e.lastActivity > 60000) continue;
+		for (const [sid, e] of agentState) {
+			if (now - e.lastActivity > 60000) { agentState.delete(sid); continue; }
 			if (e.lastActivity > bestT) {
 				bestT = e.lastActivity;
 				best = e.status;
@@ -1655,7 +1652,9 @@ export function apply(ctx, config) {
 	const actions = buildActions(cfg, client, shared, player, apiHandle, habits, {
 		coordinator,
 		preference: tasteProfile ? createPreferenceAction(tasteProfile) : null,
-		localLibrary
+		localLibrary,
+		pool: recommendationPool,
+		scheduler: recommendationScheduler
 	});
 	const disposers = [];
 	for (const definition of buildTools(cfg, actions)) {
@@ -1666,12 +1665,15 @@ export function apply(ctx, config) {
 		registerRoutes(webServer, actions);
 	}
 	if (typeof ctx.on === 'function') {
-		ctx.on('dispose', () => {
+		ctx.on('dispose', async () => {
 			coordinator?.cancel('plugin disposed');
+			recommendationScheduler?.dispose();
 			for (const dispose of disposers) dispose();
-			if (apiHandle && apiHandle.handle) {
-				stopApiServer(apiHandle.handle).catch(() => {});
-			}
+			await Promise.allSettled([
+				player.dispose(),
+				habits.flush(),
+				apiHandle && apiHandle.handle ? stopApiServer(apiHandle.handle) : Promise.resolve()
+			]);
 		});
 	}
 }

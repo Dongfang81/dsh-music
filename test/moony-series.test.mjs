@@ -75,6 +75,169 @@ test('catalog contains the first wave and the three retained listening-style cha
 	}
 });
 
+test('state polling slows down when collapsed, hidden, or in a background tab', () => {
+	const { statePollDelay } = loadClient();
+	assert.equal(statePollDelay({ collapsed: false, hidden: false, documentHidden: false }), 1500);
+	assert.equal(statePollDelay({ collapsed: true, hidden: false, documentHidden: false }), 5000);
+	assert.equal(statePollDelay({ collapsed: false, hidden: true, documentHidden: false }), 15000);
+	assert.equal(statePollDelay({ collapsed: false, hidden: false, documentHidden: true }), 15000);
+});
+
+test('state poller coalesces refreshes while one request is in flight', async () => {
+	const { createStatePoller } = loadClient();
+	const timers = [];
+	const requests = [];
+	const poller = createStatePoller({
+		request() { return new Promise((resolve) => requests.push(resolve)); },
+		getDelay() { return 5000; },
+		setTimer(fn, delay) { timers.push({ fn, delay }); return timers.length; },
+		clearTimer() {}
+	});
+	poller.start();
+	poller.refresh();
+	poller.refresh();
+	assert.equal(requests.length, 1);
+	requests.shift()();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(requests.length, 1, 'multiple pending refreshes become one follow-up request');
+	requests.shift()();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(timers.at(-1).delay, 5000);
+	poller.stop();
+});
+
+test('state fetch timeout aborts a hung request so polling can recover', async () => {
+	const { fetchJsonWithTimeout } = loadClient();
+	const timers = [];
+	const cleared = [];
+	const pending = fetchJsonWithTimeout('/dsh-alger/state', { timeoutMs: 5000 }, {
+		AbortController,
+		fetch(_path, options) {
+			return new Promise((_resolve, reject) => {
+				options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+			});
+		},
+		setTimer(fn, delay) { timers.push({ fn, delay }); return timers.length; },
+		clearTimer(id) { cleared.push(id); }
+	});
+	assert.equal(timers[0].delay, 5000);
+	timers[0].fn();
+	await assert.rejects(() => pending, /request timeout/);
+	assert.deepEqual(cleared, [1]);
+});
+
+test('compact state signatures ignore object identity and collection reloads require an open stale panel', () => {
+	const { compactStateSignature, shouldReloadCollection } = loadClient();
+	const first = {
+		stateRevision: 3,
+		musicApiUp: true,
+		playing: { song: { id: 1, name: '晴天' }, isPlaying: true },
+		queue: { count: 60, index: 4, revision: 8 },
+		favorites: { count: 2, revision: 5 },
+		recommendation: { ready: true, count: 60, generating: false, lastError: null }
+	};
+	assert.equal(compactStateSignature(first), compactStateSignature(JSON.parse(JSON.stringify(first))));
+	assert.notEqual(compactStateSignature(first), compactStateSignature({ ...first, queue: { ...first.queue, revision: 9 } }));
+	assert.equal(shouldReloadCollection(null, 4, true), true);
+	assert.equal(shouldReloadCollection(4, 4, true), false);
+	assert.equal(shouldReloadCollection(4, 5, false), false);
+	assert.equal(shouldReloadCollection(4, 5, true), true);
+});
+
+test('virtual window renders every short row but bounds long collection work', () => {
+	const { virtualWindow } = loadClient();
+	assert.deepEqual({ ...virtualWindow(20, 500, 29, 205, 5, 50) }, {
+		virtualized: false, start: 0, end: 20, padTop: 0, padBottom: 0
+	});
+	assert.deepEqual({ ...virtualWindow(120, 580, 29, 205, 5, 50) }, {
+		virtualized: true, start: 15, end: 33, padTop: 435, padBottom: 2523
+	});
+});
+
+test('playback reporter sends on transitions and checkpoints only while active', async () => {
+	const { createPlaybackReporter } = loadClient();
+	let active = false;
+	let nextTimer = 0;
+	const timers = new Map();
+	const sent = [];
+	const reporter = createPlaybackReporter({
+		read: () => ({ playing: active, position: sent.length * 5 }),
+		send: async (payload) => { sent.push(payload); },
+		intervalMs: 5000,
+		setTimer(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
+		clearTimer(id) { timers.delete(id); }
+	});
+	active = true;
+	await reporter.setPlaying(true);
+	assert.equal(sent.length, 1);
+	assert.equal(timers.size, 1);
+	assert.equal([...timers.values()][0].delay, 5000);
+	await reporter.setPlaying(true);
+	assert.equal(sent.length, 1, 'repeated play events do not duplicate sends or timers');
+	assert.equal(timers.size, 1);
+
+	const [timerId, timer] = [...timers.entries()][0];
+	timers.delete(timerId);
+	timer.fn();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(sent.length, 2);
+	assert.equal(timers.size, 1, 'a periodic checkpoint schedules its successor after settling');
+	await reporter.checkpoint();
+	assert.equal(sent.length, 3);
+	assert.equal(timers.size, 1);
+
+	active = false;
+	await reporter.setPlaying(false);
+	assert.equal(sent.length, 4, 'pause is reported immediately');
+	assert.equal(timers.size, 0, 'paused playback has no periodic wakeup');
+	reporter.dispose();
+	assert.equal(timers.size, 0);
+});
+
+test('audio analyzer lifecycle samples only when enabled playing and visible', async () => {
+	const { createAnalyzerLifecycle } = loadClient();
+	let nextTimer = 0;
+	const timers = new Map();
+	const events = [];
+	const lifecycle = createAnalyzerLifecycle({
+		sample: () => ({ energy: 0.5 }),
+		onSample: (value) => events.push(['sample', value.energy]),
+		resume: async () => { events.push(['resume']); },
+		suspend: async () => { events.push(['suspend']); },
+		close: async () => { events.push(['close']); },
+		intervalMs: 800,
+		setTimer(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
+		clearTimer(id) { timers.delete(id); }
+	});
+	lifecycle.update({ enabled: true, playing: true, visible: true });
+	await Promise.resolve();
+	assert.deepEqual(events, [['resume']]);
+	assert.equal(timers.size, 1);
+	assert.equal([...timers.values()][0].delay, 800);
+	lifecycle.update({ enabled: true, playing: true, visible: true });
+	assert.equal(timers.size, 1, 'repeated active updates keep one sampler');
+
+	const [timerId, timer] = [...timers.entries()][0];
+	timers.delete(timerId);
+	timer.fn();
+	assert.deepEqual(events.at(-1), ['sample', 0.5]);
+	assert.equal(timers.size, 1);
+	lifecycle.update({ enabled: true, playing: false, visible: true });
+	await Promise.resolve();
+	assert.equal(timers.size, 0);
+	assert.deepEqual(events.at(-1), ['suspend']);
+	lifecycle.update({ enabled: true, playing: true, visible: false });
+	assert.equal(timers.size, 0);
+	lifecycle.update({ enabled: true, playing: true, visible: true });
+	await Promise.resolve();
+	assert.deepEqual(events.at(-1), ['resume']);
+	assert.equal(timers.size, 1);
+	lifecycle.dispose();
+	await Promise.resolve();
+	assert.equal(timers.size, 0);
+	assert.deepEqual(events.at(-1), ['close']);
+});
+
 test('moon phase clamps progress and fades only through the final eight percent', () => {
 	const { resolveMoonPhase } = loadClient();
 	assert.deepEqual(Object.values(resolveMoonPhase(-1)), [0, 1]);
@@ -126,67 +289,71 @@ test('audio buffering bindings start on starvation events and clear on recovery'
 	assert.equal(removed.length, 9);
 });
 
-test('heart long press opens organization without also firing the one-click favorite action', () => {
-	const { createLongPressHandlers } = loadClient();
-	const scheduled = [];
-	const timerRef = { current: null };
-	const triggeredRef = { current: false };
+test('favorite heart is a one-click toggle with no organization gesture', () => {
+	const { FavoriteHeartButton } = loadClient();
 	const events = [];
-	const handlers = createLongPressHandlers({
-		timerRef,
-		triggeredRef,
-		setTimer(callback) { scheduled.push(callback); return scheduled.length; },
-		clearTimer() {},
-		onLongPress() { events.push('organize'); },
-		onClick() { events.push('favorite'); }
-	});
-
-	handlers.onPointerDown();
-	scheduled[0]();
-	handlers.onPointerUp();
-	handlers.onClick({ preventDefault() {} });
-	assert.deepEqual(events, ['organize']);
-
-	handlers.onPointerDown();
-	handlers.onPointerUp();
-	handlers.onClick({ preventDefault() {} });
-	assert.deepEqual(events, ['organize', 'favorite']);
+	const tree = FavoriteHeartButton({ active: true, disabled: false, onToggle() { events.push('favorite'); } });
+	assert.equal(tree.type, 'button');
+	assert.equal(tree.props.title, '收藏/取消收藏当前歌曲');
+	assert.equal(tree.props.onPointerDown, undefined);
+	assert.equal(tree.props.onPointerUp, undefined);
+	tree.props.onClick();
+	assert.deepEqual(events, ['favorite']);
 });
 
-test('favorite collection panel keeps all immutable and exposes organization on every song', () => {
-	const { FavoriteCollectionPanel } = loadClient();
-	const collections = [
-		{ id: 'all', name: '全部收藏', count: 2, system: true },
-		{ id: 'focus', name: '工作', count: 1 }
-	];
-	const songs = [
-		{ id: 1, name: '晴天', artists: '周杰伦' },
-		{ id: 2, name: '夜曲', artists: '周杰伦' }
-	];
-	const all = FavoriteCollectionPanel({ collections, activeId: 'all', songs });
-	assert.equal(findNodes(all, (node) => node.type === 'button' && node.props?.children === '收藏到…').length, 2);
-	assert.equal(findNodes(all, (node) => node.props?.['data-collection-rename']).length, 0);
-	assert.equal(findNodes(all, (node) => node.props?.['data-collection-delete']).length, 0);
-
-	const custom = FavoriteCollectionPanel({ collections, activeId: 'focus', songs: [songs[0]] });
-	assert.equal(findNodes(custom, (node) => node.props?.['data-collection-rename']).length, 1);
-	assert.equal(findNodes(custom, (node) => node.props?.['data-collection-delete']).length, 1);
+test('favorite list keeps the compact play icon directly after the song count', () => {
+	const { FavoriteListPanel } = loadClient();
+	const events = [];
+	const tree = FavoriteListPanel({
+		songs: [
+			{ id: 1, name: '晴天', artists: '周杰伦' },
+			{ id: 2, name: '夜曲', artists: '周杰伦' }
+		],
+		onPlayAll() { events.push('all'); },
+		onPlayFrom(index) { events.push(`from:${index}`); }
+	});
+	const head = findNodes(tree, (node) => node.props?.className === 'dsa-favorites-head')[0];
+	assert.equal(head.props.children[1].props.children, '2 首');
+	const play = head.props.children[2];
+	assert.equal(play.type, 'button');
+	assert.equal(play.props['aria-label'], '播放全部收藏');
+	assert.notEqual(play.props.children, '播放全部');
+	play.props.onClick();
+	const rows = findNodes(tree, (node) => node.props?.className === 'dsa-favorite-row');
+	rows[1].props.onClick();
+	assert.deepEqual(events, ['all', 'from:1']);
 });
 
-test('favorite membership picker supports multiple custom collections and never treats all as assignable', () => {
-	const { FavoriteMembershipPicker } = loadClient();
-	const tree = FavoriteMembershipPicker({
-		song: { id: 1, name: '晴天' },
-		collections: [
-			{ id: 'all', name: '全部收藏', songIds: [1], system: true },
-			{ id: 'focus', name: '工作', songIds: [1] },
-			{ id: 'night', name: '夜晚', songIds: [] }
-		]
+test('favorite list initially mounts only a bounded window for long collections', () => {
+	const { FavoriteListPanel } = loadClient();
+	const songs = Array.from({ length: 120 }, (_, index) => ({
+		id: index + 1, name: `歌曲${index + 1}`, artists: '歌手'
+	}));
+	const tree = FavoriteListPanel({ songs });
+	const rows = findNodes(tree, (node) => node.props?.className === 'dsa-favorite-row');
+	const spacer = findNodes(tree, (node) => node.props?.className === 'dsa-virtual-space')[0];
+	assert.equal(rows.length, 13, 'viewport plus overscan is mounted instead of all 120 rows');
+	assert.equal(spacer.props.style.height, 120 * 29);
+	assert.equal(rows[0].props.children[0].props.children, '1.');
+});
+
+test('favorite rows expose a lightweight remove control without starting playback', () => {
+	const { FavoriteListPanel } = loadClient();
+	const events = [];
+	const tree = FavoriteListPanel({
+		songs: [{ id: 1, name: '晴天', artists: '周杰伦' }],
+		onPlayFrom(index) { events.push(`play:${index}`); },
+		onRemove(song) { events.push(`remove:${song.id}`); }
 	});
-	const boxes = findNodes(tree, (node) => node.type === 'input' && node.props?.type === 'checkbox');
-	assert.deepEqual(boxes.map((node) => node.props.value), ['focus', 'night']);
-	assert.deepEqual(boxes.map((node) => node.props.defaultChecked), [true, false]);
-	assert.equal(findNodes(tree, (node) => node.type === 'button' && node.props?.children === '保存').length, 1);
+	const row = findNodes(tree, (node) => node.props?.className === 'dsa-favorite-row')[0];
+	const remove = findNodes(row, (node) => node.type === 'button' && node.props?.['aria-label'] === '取消收藏晴天')[0];
+	assert.equal(row.type, 'div', 'row must not nest a remove button inside another button');
+	assert.equal(row.props.role, 'button');
+	assert.ok(remove);
+	remove.props.onClick({ stopPropagation() { events.push('stop'); } });
+	assert.deepEqual(events, ['stop', 'remove:1']);
+	row.props.onClick();
+	assert.deepEqual(events, ['stop', 'remove:1', 'play:0']);
 });
 
 test('queue song row exposes one lightweight remove control that does not select the row', () => {
@@ -204,13 +371,25 @@ test('queue song row exposes one lightweight remove control that does not select
 	assert.deepEqual(events, ['stop', 'remove:2']);
 });
 
-test('cross-source search rows add by their verified keyword instead of the synthetic zero id', () => {
+test('queue list preserves original indices while virtualizing long queues', () => {
+	const { QueueListPanel } = loadClient();
+	const items = Array.from({ length: 120 }, (_, index) => ({ id: index + 1, name: `歌曲${index + 1}`, artists: '歌手' }));
+	const tree = QueueListPanel({ items, currentIndex: 87, selectedIndex: 90 });
+	const rows = findNodes(tree, (node) => typeof node.props?.className === 'string' && node.props.className.includes('dsa-qitem'));
+	assert.equal(rows.length, 10, '130px queue viewport mounts only its initial overscanned rows');
+	assert.equal(rows[0].props.children[0].props.children, '1.');
+	assert.equal(findNodes(tree, (node) => node.props?.className === 'dsa-virtual-space')[0].props.style.height, 120 * 28);
+});
+
+test('search rows add by their catalog song id', () => {
 	const { queuePayloadForSearchItem } = loadClient();
-	assert.deepEqual(
-		Object.values(queuePayloadForSearchItem({ id: 0, crossSource: true, playKeyword: '周杰伦 晴天' })),
-		['add', '周杰伦 晴天']
-	);
 	assert.deepEqual(Object.values(queuePayloadForSearchItem({ id: 123 })), ['add', 123]);
+});
+
+test('an empty strict search surfaces the server guidance instead of looking broken', () => {
+	const { searchFeedbackForResponse } = loadClient();
+	assert.equal(searchFeedbackForResponse({ ok: true, items: [], guidance: '没有找到可靠原唱。' }), '没有找到可靠原唱。');
+	assert.equal(searchFeedbackForResponse({ ok: true, items: [{ id: 1 }] }), null);
 });
 
 test('resolver falls back to Classic, idle, and a blank face', () => {

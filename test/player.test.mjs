@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -18,6 +18,20 @@ test('recommendations insert after current without replacing manual songs', () =
 	assert.deepEqual(player.state.queue.map((item) => item.moonyOrigin), ['manual', 'recommendation', 'recommendation', 'manual']);
 });
 
+test('button recommendation starts its first song while preserving manual queue entries', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '当前'), song(2, '手动加入')]);
+	player.insertRecommendationAfterCurrent(
+		[song(3, '推荐一'), song(4, '推荐二')],
+		'button-recommendation',
+		{ playFirst: true }
+	);
+	assert.deepEqual(player.state.queue.map((item) => item.name), ['当前', '推荐一', '推荐二', '手动加入']);
+	assert.equal(player.current().name, '推荐一');
+	assert.equal(player.state.index, 1);
+	assert.equal(player.state.playing, true);
+});
+
 test('same-session replan replaces only its unplayed recommendation entries', () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([song(1, '当前'), song(2, '手动加入')]);
@@ -25,6 +39,15 @@ test('same-session replan replaces only its unplayed recommendation entries', ()
 	player.insertRecommendationAfterCurrent([song(5, '新推荐')], 'session-1');
 	assert.deepEqual(player.state.queue.map((item) => item.name), ['当前', '新推荐', '手动加入']);
 	assert.equal(player.state.queue[1].recommendationSessionId, 'session-1');
+});
+
+test('a second button batch replaces unplayed recommendations and preserves manual songs', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '当前'), song(2, '手动加入')]);
+	player.insertRecommendationAfterCurrent([song(3, '旧推荐一'), song(4, '旧推荐二')], 'button-recommendation');
+	player.insertRecommendationAfterCurrent([song(5, '新推荐一'), song(6, '新推荐二')], 'button-recommendation');
+	assert.deepEqual(player.state.queue.map((item) => item.name), ['当前', '新推荐一', '新推荐二', '手动加入']);
+	assert.equal(player.current().name, '当前');
 });
 
 test('canonical recommendation tracks are converted back to player song shape', () => {
@@ -49,49 +72,72 @@ test('recommendation starts its first verified track when nothing is active', ()
 	assert.equal(player.state.playing, true);
 });
 
-test('legacy favorites load into an immutable virtual all collection', (t) => {
+test('favorites stay as one flat list when loading state written by the collection experiment', (t) => {
 	const directory = mkdtempSync(join(tmpdir(), 'moony-player-'));
 	t.after(() => rmSync(directory, { recursive: true, force: true }));
 	const file = join(directory, 'state.json');
-	writeFileSync(file, JSON.stringify({ favorites: [song(1, '晴天'), song(2, '夜曲')] }));
+	writeFileSync(file, JSON.stringify({
+		favorites: [song(1, '晴天'), song(2, '夜曲')],
+		favoriteCollections: [{ id: 'focus', name: '工作', songIds: [1] }]
+	}));
 
 	const player = createPlayer({ file });
-	assert.deepEqual(player.listFavoriteCollections(), [{
-		id: 'all', name: '全部收藏', songIds: [1, 2], count: 2, system: true
-	}]);
-	assert.deepEqual(player.favoriteCollection('all').songs.map((item) => item.id), [1, 2]);
-	assert.throws(() => player.renameFavoriteCollection('all', '别的名字'), /不能重命名/);
-	assert.throws(() => player.deleteFavoriteCollection('all'), /不能删除/);
+	assert.deepEqual(player.state.favorites.map((item) => item.id), [1, 2]);
+	assert.equal(player.state.favoriteCollections, undefined);
+	assert.equal(player.snapshot().favoriteCollections, undefined);
+	assert.equal(player.playFavorites().count, 2);
 });
 
-test('custom collections support multiple memberships without changing global favorite semantics', () => {
-	const ids = ['focus', 'night'];
-	const player = createPlayer({ file: null, createCollectionId: () => ids.shift() });
-	player.replaceAndPlay([song(1, '晴天'), song(2, '夜曲')]);
+test('player flush atomically persists the latest debounced state before shutdown', async (t) => {
+	const directory = mkdtempSync(join(tmpdir(), 'moony-player-flush-'));
+	t.after(() => rmSync(directory, { recursive: true, force: true }));
+	const file = join(directory, 'state.json');
+	const player = createPlayer({ file, saveDelayMs: 60000 });
+
+	player.replaceAndPlay([song(1, '晴天')]);
+	player.toggleFavorite();
+	player.volumeDown();
+	assert.equal(existsSync(file), false, 'the long debounce keeps disk I/O off the mutation path');
+	await player.dispose();
+
+	const saved = JSON.parse(readFileSync(file, 'utf8'));
+	assert.deepEqual(saved.queue.map((item) => item.id), [1]);
+	assert.deepEqual(saved.favorites.map((item) => item.id), [1]);
+	assert.equal(saved.volume, 0.7);
+	assert.equal(typeof saved.at, 'number');
+	assert.equal(typeof player.flush, 'function');
+});
+
+test('playing favorites from one row keeps the full favorite list as playback context', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '晴天'), song(2, '夜曲'), song(3, '七里香')]);
+	for (let index = 0; index < 3; index += 1) {
+		player.jump(index);
+		player.toggleFavorite();
+	}
+	const result = player.playFavorites(1);
+	assert.equal(result.song.id, 2);
+	assert.equal(result.count, 3);
+	assert.deepEqual(player.state.queue.map((item) => item.id), [1, 2, 3]);
+	assert.equal(player.state.index, 1);
+});
+
+test('removing a favorite by id preserves the current song and playback queue', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '晴天'), song(2, '夜曲'), song(3, '七里香')]);
 	player.toggleFavorite();
 	player.jump(1);
 	player.toggleFavorite();
+	const queueBefore = player.state.queue.map((item) => item.id);
+	const currentBefore = player.current().id;
 
-	const focus = player.createFavoriteCollection('工作');
-	const night = player.createFavoriteCollection('夜晚');
-	assert.equal(focus.id, 'focus');
-	assert.equal(night.id, 'night');
-	player.setFavoriteMemberships(1, ['focus', 'night']);
-	player.setFavoriteMemberships(2, ['night']);
-	assert.deepEqual(player.favoriteCollection('focus').songs.map((item) => item.id), [1]);
-	assert.deepEqual(player.favoriteCollection('night').songs.map((item) => item.id), [1, 2]);
+	const result = player.removeFavorite(1);
 
-	player.renameFavoriteCollection('focus', '专注');
-	assert.equal(player.favoriteCollection('focus').name, '专注');
-	assert.throws(() => player.createFavoriteCollection(' 专注 '), /已存在/);
-	player.deleteFavoriteCollection('focus');
-	assert.deepEqual(player.state.favorites.map((item) => item.id), [1, 2]);
-
-	player.jump(0);
-	const unfavorited = player.toggleFavorite();
-	assert.equal(unfavorited.favorite, false);
-	assert.deepEqual(player.favoriteCollection('all').songs.map((item) => item.id), [2]);
-	assert.deepEqual(player.favoriteCollection('night').songs.map((item) => item.id), [2]);
+	assert.equal(result.removed.id, 1);
+	assert.deepEqual(result.favoriteIds, [2]);
+	assert.equal(result.count, 1);
+	assert.deepEqual(player.state.queue.map((item) => item.id), queueBefore);
+	assert.equal(player.current().id, currentBefore);
 });
 
 test('removing a non-current queue item preserves the active song and undo restores order', () => {
@@ -158,4 +204,56 @@ test('queue removal validates indices and only the latest removal can be undone'
 	const second = player.removeQueueAt(1);
 	assert.throws(() => player.undoQueueRemoval(first.token), /已失效/);
 	assert.equal(player.undoQueueRemoval(second.token).restored.id, 2);
+});
+
+test('player revisions change only for material state and collection mutations', () => {
+	const player = createPlayer({ file: null });
+	const initial = player.revisions();
+	assert.deepEqual(initial, { stateRevision: 1, queueRevision: 1, favoritesRevision: 1 });
+	player.reportPlayback({ position: 0, duration: 0, ready: false });
+	player.append([]);
+	assert.deepEqual(player.revisions(), initial, 'unchanged reports and empty appends do not invalidate state');
+
+	player.append([song(1, '一')]);
+	assert.deepEqual(player.revisions(), { stateRevision: 2, queueRevision: 2, favoritesRevision: 1 });
+	player.jump(0);
+	const beforeFavorite = player.revisions();
+	player.toggleFavorite();
+	assert.deepEqual(player.revisions(), {
+		stateRevision: beforeFavorite.stateRevision + 1,
+		queueRevision: beforeFavorite.queueRevision,
+		favoritesRevision: beforeFavorite.favoritesRevision + 1
+	});
+});
+
+test('compact snapshots omit collection rows while queueView provides revisioned rows', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '一'), song(2, '二')]);
+	player.toggleFavorite();
+
+	const legacy = player.snapshot();
+	assert.equal(legacy.queue.items.length, 2);
+	assert.deepEqual(legacy.favoriteIds, [1]);
+
+	const compact = player.snapshot({ includeQueue: false, includeFavoriteIds: false });
+	assert.deepEqual(compact.queue, {
+		count: 2,
+		index: 0,
+		revision: player.revisions().queueRevision
+	});
+	assert.deepEqual(compact.favorites, {
+		count: 1,
+		revision: player.revisions().favoritesRevision
+	});
+	assert.equal('favoriteIds' in compact, false);
+	assert.equal(compact.stateRevision, player.revisions().stateRevision);
+	assert.deepEqual(player.queueView(), {
+		revision: player.revisions().queueRevision,
+		count: 2,
+		index: 0,
+		items: [
+			{ id: 1, name: '一', artists: '歌手1' },
+			{ id: 2, name: '二', artists: '歌手2' }
+		]
+	});
 });

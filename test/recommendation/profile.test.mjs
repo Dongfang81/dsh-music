@@ -22,6 +22,15 @@ test('favorite outweighs one accidental short skip', async () => {
 	assert.ok(entry.affinity > 0);
 });
 
+test('unfavorite removes the positive favorite signal without permanently excluding the track', async () => {
+	const profile = createTasteProfile({ file: null, now: () => NOW });
+	await profile.record({ type: 'favorite', track: jay, at: NOW });
+	const result = await profile.record({ type: 'unfavorite', track: jay, at: NOW + 1000 });
+	assert.equal(result.events.favorite, 1);
+	assert.equal(result.events.unfavorite, 1);
+	assert.ok(result.affinity <= 0.1);
+});
+
 test('old positive affinity decays without becoming negative', async () => {
 	let clock = NOW;
 	const profile = createTasteProfile({ file: null, now: () => clock });

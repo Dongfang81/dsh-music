@@ -19,8 +19,209 @@ window.__ModuleLoader__.load({
 		var ReactDOM = require("react-dom");
 		var h = React.createElement;
 
-		/** 轮询间隔（ms）。 */
-		var POLL_MS = 1500;
+		/** 根据播放器可见性选择轮询间隔，后台与完全隐藏时主动降频。 */
+		function statePollDelay(input) {
+			var value = input || {};
+			if (value.hidden || value.documentHidden) return 15000;
+			return value.collapsed ? 5000 : 1500;
+		}
+
+		/** 单飞状态轮询器：慢请求期间的多个刷新合并成一次跟进请求。 */
+		function createStatePoller(options) {
+			var request = options.request;
+			var getDelay = options.getDelay;
+			var setTimer = options.setTimer || setTimeout;
+			var clearTimer = options.clearTimer || clearTimeout;
+			var timer = null;
+			var running = false;
+			var pending = false;
+			var stopped = true;
+
+			function schedule() {
+				if (stopped) return;
+				timer = setTimer(function () { timer = null; run(); }, getDelay());
+			}
+			async function run() {
+				if (stopped || running) { if (!stopped) pending = true; return; }
+				running = true;
+				try { await request(); } catch { /* 单次状态失败由下一轮恢复 */ }
+				finally {
+					running = false;
+					if (stopped) return;
+					if (pending) { pending = false; run(); }
+					else schedule();
+				}
+			}
+			function refresh() {
+				if (stopped) return false;
+				if (timer !== null) { clearTimer(timer); timer = null; }
+				if (running) { pending = true; return true; }
+				run();
+				return true;
+			}
+			function start() { if (!stopped) return; stopped = false; refresh(); }
+			function stop() {
+				stopped = true;
+				pending = false;
+				if (timer !== null) { clearTimer(timer); timer = null; }
+			}
+			return { start: start, refresh: refresh, stop: stop };
+		}
+
+		function fetchJsonWithTimeout(path, options, runtime) {
+			var config = options || {};
+			var env = runtime || {};
+			var fetchFn = env.fetch || fetch;
+			var AbortControllerClass = env.AbortController || AbortController;
+			var setTimer = env.setTimer || setTimeout;
+			var clearTimer = env.clearTimer || clearTimeout;
+			var controller = new AbortControllerClass();
+			var timer = setTimer(function () { controller.abort(new Error("request timeout")); }, config.timeoutMs || 5000);
+			var request = Object.assign({}, config.request || {}, { signal: controller.signal });
+			return fetchFn(path, request)
+				.then(function (response) { return response.json(); })
+				.finally(function () { clearTimer(timer); });
+		}
+
+		function compactStateSignature(input) {
+			var state = input || {};
+			var playing = state.playing || {};
+			var song = playing.song || {};
+			var playback = state.playback || {};
+			var queue = state.queue || {};
+			var favorites = state.favorites || {};
+			var recommendation = state.recommendation || {};
+			return JSON.stringify([
+				state.ok, state.musicApiUp, state.stateRevision,
+				song.id, song.name, playing.isPlaying,
+				playback.position, playback.duration, playback.playing,
+				state.favorite, state.favoriteCount, state.playMode, state.volume,
+				state.currentUrl, state.ready, state.notice, state.agentStatus,
+				queue.count, queue.index, queue.revision,
+				favorites.count, favorites.revision,
+				recommendation.ready, recommendation.count, recommendation.generating, recommendation.lastError
+			]);
+		}
+
+		function shouldReloadCollection(cachedRevision, remoteRevision, open) {
+			return Boolean(open) && remoteRevision !== undefined && remoteRevision !== null && cachedRevision !== remoteRevision;
+		}
+
+		function virtualWindow(total, scrollTop, rowHeight, viewportHeight, overscan, threshold) {
+			var count = Math.max(0, Number(total) || 0);
+			var limit = threshold === undefined ? 50 : Math.max(0, Number(threshold) || 0);
+			if (count <= limit) return { virtualized: false, start: 0, end: count, padTop: 0, padBottom: 0 };
+			var height = Math.max(1, Number(rowHeight) || 1);
+			var viewport = Math.max(0, Number(viewportHeight) || 0);
+			var extra = Math.max(0, Number(overscan) || 0);
+			var offset = Math.max(0, Number(scrollTop) || 0);
+			var start = Math.max(0, Math.floor(offset / height) - extra);
+			var end = Math.min(count, Math.ceil((offset + viewport) / height) + extra);
+			return {
+				virtualized: true,
+				start: start,
+				end: end,
+				padTop: start * height,
+				padBottom: (count - end) * height
+			};
+		}
+
+		function createPlaybackReporter(options) {
+			var read = options.read;
+			var send = options.send;
+			var intervalMs = options.intervalMs || 5000;
+			var setTimer = options.setTimer || setTimeout;
+			var clearTimer = options.clearTimer || clearTimeout;
+			var playing = false;
+			var timer = null;
+			var inFlight = null;
+			var pending = false;
+			var disposed = false;
+
+			function clearSchedule() {
+				if (timer !== null) { clearTimer(timer); timer = null; }
+			}
+			function schedule() {
+				if (disposed || !playing || timer !== null || inFlight) return;
+				timer = setTimer(function () { timer = null; transmit(); }, intervalMs);
+			}
+			function transmit() {
+				if (disposed) return Promise.resolve(false);
+				clearSchedule();
+				if (inFlight) { pending = true; return inFlight; }
+				inFlight = Promise.resolve()
+					.then(function () { return send(read()); })
+					.then(function () { return true; }, function () { return false; })
+					.finally(function () {
+						inFlight = null;
+						if (disposed) return;
+						if (pending) { pending = false; transmit(); }
+						else schedule();
+					});
+				return inFlight;
+			}
+			function setPlaying(value) {
+				var next = Boolean(value);
+				if (next === playing) return inFlight || Promise.resolve(false);
+				playing = next;
+				return transmit();
+			}
+			function dispose() {
+				disposed = true;
+				playing = false;
+				pending = false;
+				clearSchedule();
+			}
+			return { setPlaying: setPlaying, checkpoint: transmit, dispose: dispose };
+		}
+
+		function createAnalyzerLifecycle(options) {
+			var intervalMs = options.intervalMs || 800;
+			var setTimer = options.setTimer || setTimeout;
+			var clearTimer = options.clearTimer || clearTimeout;
+			var active = false;
+			var disposed = false;
+			var timer = null;
+
+			function clearSchedule() {
+				if (timer !== null) { clearTimer(timer); timer = null; }
+			}
+			function schedule() {
+				if (!active || disposed || timer !== null) return;
+				timer = setTimer(function () {
+					timer = null;
+					if (!active || disposed) return;
+					var value = options.sample();
+					if (value) options.onSample(value);
+					schedule();
+				}, intervalMs);
+			}
+			function start() {
+				if (active || disposed) return;
+				active = true;
+				Promise.resolve(options.resume()).catch(function () {});
+				schedule();
+			}
+			function stop() {
+				if (!active) return;
+				active = false;
+				clearSchedule();
+				Promise.resolve(options.suspend()).catch(function () {});
+			}
+			function update(value) {
+				var next = value || {};
+				if (next.enabled && next.playing && next.visible) start();
+				else stop();
+			}
+			function dispose() {
+				if (disposed) return;
+				stop();
+				disposed = true;
+				clearSchedule();
+				Promise.resolve(options.close()).catch(function () {});
+			}
+			return { update: update, dispose: dispose };
+		}
 		/** 展开宽度。 */
 		var WIDTH = 280;
 		/** 本地存储键。 */
@@ -245,86 +446,85 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
-		function createLongPressHandlers(options) {
-			var input = options || {};
-			var timerRef = input.timerRef || { current: null };
-			var triggeredRef = input.triggeredRef || { current: false };
-			var setTimer = input.setTimer || setTimeout;
-			var clearTimer = input.clearTimer || clearTimeout;
-			var clear = function () {
-				if (timerRef.current !== null) clearTimer(timerRef.current);
-				timerRef.current = null;
-			};
-			return {
-				onPointerDown: function () {
-					triggeredRef.current = false;
-					clear();
-					timerRef.current = setTimer(function () {
-						timerRef.current = null;
-						triggeredRef.current = true;
-						if (typeof input.onLongPress === "function") input.onLongPress();
-					}, input.delay || 550);
-				},
-				onPointerUp: clear,
-				onPointerLeave: clear,
-				onPointerCancel: clear,
-				onClick: function (event) {
-					if (triggeredRef.current) {
-						triggeredRef.current = false;
-						if (event && typeof event.preventDefault === "function") event.preventDefault();
-						return;
-					}
-					if (typeof input.onClick === "function") input.onClick(event);
-				}
-			};
+		function FavoriteHeartButton(props) {
+			return h("button", {
+				className: "dsa-btn dsa-fav" + (props && props.active ? " active" : ""),
+				title: "收藏/取消收藏当前歌曲",
+				disabled: Boolean(props && props.disabled),
+				onClick: props && props.onToggle
+			}, "♥");
 		}
 
-		function FavoriteMembershipPicker(props) {
-			var song = props && props.song;
-			var collections = Array.isArray(props && props.collections) ? props.collections.filter(function (item) { return item && item.id !== "all"; }) : [];
-			var selected = Object.create(null);
-			collections.forEach(function (item) { selected[item.id] = Array.isArray(item.songIds) && song && item.songIds.some(function (id) { return String(id) === String(song.id); }); });
-			return h("div", { className: "dsa-fav-picker", role: "dialog", "aria-label": "收藏到" }, [
-				h("div", { key: "title", className: "dsa-fav-panel-title" }, "收藏到…"),
-				collections.length ? collections.map(function (item) {
-					return h("label", { key: item.id, className: "dsa-fav-check" }, [
-						h("input", { type: "checkbox", value: item.id, defaultChecked: selected[item.id], onChange: function (event) { selected[item.id] = Boolean(event.target.checked); } }),
-						h("span", null, item.name)
-					]);
-				}) : h("div", { key: "empty", className: "dsa-fav-empty" }, "还没有自定义目录，可先新建一个。"),
-				h("div", { key: "actions", className: "dsa-fav-panel-actions" }, [
-					h("button", { type: "button", onClick: function () { if (typeof props.onClose === "function") props.onClose(); } }, "取消"),
-					h("button", { type: "button", className: "primary", onClick: function () { if (typeof props.onSave === "function") props.onSave(Object.keys(selected).filter(function (id) { return selected[id]; })); } }, "保存")
-				])
-			]);
+		function VirtualizedRows(props) {
+			var items = Array.isArray(props && props.items) ? props.items : [];
+			var [scrollTop, setScrollTop] = React.useState(0);
+			var windowed = virtualWindow(items.length, scrollTop, props.rowHeight, props.viewportHeight, props.overscan, props.threshold);
+			var rows = items.slice(windowed.start, windowed.end).map(function (item, offset) {
+				return props.renderRow(item, windowed.start + offset);
+			});
+			if (items.length === 0) {
+				return h("div", { key: props.listKey, className: props.className }, props.empty);
+			}
+			if (!windowed.virtualized) return h("div", { key: props.listKey, className: props.className }, rows);
+			return h("div", {
+				key: props.listKey,
+				className: props.className,
+				onScroll: function (event) { setScrollTop(event.currentTarget.scrollTop || 0); }
+			}, h("div", {
+				className: "dsa-virtual-space",
+				style: { height: items.length * props.rowHeight }
+			}, h("div", {
+				className: "dsa-virtual-window",
+				style: { transform: "translateY(" + windowed.padTop + "px)" }
+			}, rows)));
 		}
 
-		function FavoriteCollectionPanel(props) {
-			var collections = Array.isArray(props && props.collections) ? props.collections : [];
+		function FavoriteListPanel(props) {
 			var songs = Array.isArray(props && props.songs) ? props.songs : [];
-			var activeId = props && props.activeId || "all";
-			var active = collections.find(function (item) { return item.id === activeId; }) || collections[0] || { id: "all", name: "全部收藏", system: true };
-			return h("div", { className: "dsa-fav-panel", role: "dialog", "aria-label": "收藏列表" }, [
-				h("div", { key: "head", className: "dsa-fav-panel-head" }, [
-					h("strong", null, "收藏列表"),
-					h("button", { type: "button", className: "dsa-fav-close", title: "关闭", onClick: props && props.onClose }, "✕")
-				]),
-				h("div", { key: "tabs", className: "dsa-fav-tabs" }, collections.map(function (item) {
-					return h("button", { key: item.id, type: "button", className: item.id === active.id ? "active" : "", onClick: function () { if (typeof props.onSelect === "function") props.onSelect(item.id); } }, item.name + " " + (item.count || 0));
-				})),
-				h("div", { key: "tools", className: "dsa-fav-tools" }, [
-					h("button", { type: "button", disabled: songs.length === 0, onClick: function () { if (typeof props.onPlay === "function") props.onPlay(active.id); } }, "播放此目录"),
-					active.id !== "all" ? h("button", { type: "button", "data-collection-rename": active.id, onClick: function () { if (typeof props.onRename === "function") props.onRename(active); } }, "重命名") : null,
-					active.id !== "all" ? h("button", { type: "button", "data-collection-delete": active.id, onClick: function () { if (typeof props.onDelete === "function") props.onDelete(active); } }, "删除目录") : null,
-					h("button", { type: "button", onClick: function () { if (typeof props.onCreate === "function") props.onCreate(); } }, "＋ 新建")
-				]),
-				h("div", { key: "songs", className: "dsa-fav-songs" }, songs.length ? songs.map(function (song) {
-					return h("div", { key: song.id, className: "dsa-fav-song" }, [
-						h("span", { className: "t", title: song.name }, song.name),
-						h("span", { className: "s", title: song.artists || "" }, song.artists || ""),
-						h("button", { type: "button", onClick: function () { if (typeof props.onOrganize === "function") props.onOrganize(song); } }, "收藏到…")
+			var songRows = VirtualizedRows({
+				items: songs,
+				listKey: "songs",
+				className: "dsa-favorites-songs",
+				rowHeight: 29,
+				viewportHeight: 205,
+				overscan: 5,
+				threshold: 50,
+				empty: h("div", { className: "dsa-favorites-empty" }, props && props.loading ? "正在读取收藏…" : "还没有收藏音乐，播放歌曲时点红心即可收藏。"),
+				renderRow: function (song, index) {
+					var play = function () {
+						if (!Boolean(props && props.busy) && typeof props.onPlayFrom === "function") props.onPlayFrom(index);
+					};
+					return h("div", {
+						key: song.id + "-" + index, className: "dsa-favorite-row", role: "button", tabIndex: 0,
+						"aria-disabled": Boolean(props && props.busy), title: "从这首开始播放", onClick: play,
+						onKeyDown: function (event) {
+							if (event.key === "Enter" || event.key === " ") { event.preventDefault(); play(); }
+						}
+					}, [
+						h("span", { className: "n" }, (index + 1) + "."),
+						h("span", { className: "t" }, song.name),
+						h("span", { className: "s" }, song.artists || ""),
+						h("button", {
+							type: "button", className: "dsa-favorite-remove", "aria-label": "取消收藏" + song.name,
+							title: "取消收藏", disabled: Boolean(props && props.busy),
+							onClick: function (event) { event.stopPropagation(); if (typeof props.onRemove === "function") props.onRemove(song); },
+							onDoubleClick: function (event) { event.stopPropagation(); }
+						}, "×")
 					]);
-				}) : h("div", { className: "dsa-fav-empty" }, "这个目录还没有歌曲"))
+				}
+			});
+			return h("div", { className: "dsa-favorites", role: "region", "aria-label": "我的收藏" }, [
+				h("div", { key: "head", className: "dsa-favorites-head" }, [
+					h("strong", null, "我的收藏"),
+					h("span", { className: "dsa-favorites-count" }, songs.length + " 首"),
+					h("button", {
+						type: "button", className: "dsa-favorites-play", "aria-label": "播放全部收藏", title: "播放全部",
+						disabled: songs.length === 0 || Boolean(props && props.busy),
+						onClick: props && props.onPlayAll
+					}, "▶"),
+					h("button", { type: "button", className: "dsa-favorites-close", "aria-label": "关闭收藏列表", title: "关闭", onClick: props && props.onClose }, "×")
+				]),
+				songRows
 			]);
 		}
 
@@ -348,11 +548,45 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
+		function QueueListPanel(props) {
+			var items = Array.isArray(props && props.items) ? props.items : [];
+			return h("div", null, [
+				VirtualizedRows({
+					items: items,
+					className: "dsa-queue-list",
+					rowHeight: 28,
+					viewportHeight: 130,
+					overscan: 5,
+					threshold: 50,
+					empty: h("div", { className: "dsa-empty" }, props && props.loading ? "正在加载播放列表…" : "播放列表为空"),
+					renderRow: function (item, index) {
+						return QueueSongRow({
+							key: item.id + "-" + index, item: item, index: index,
+							current: index === props.currentIndex,
+							selected: index === props.selectedIndex,
+							onSelect: props.onSelect,
+							onJump: props.onJump,
+							onRemove: props.onRemove
+						});
+					}
+				}),
+				h("div", { className: "dsa-qclear-row" }, [
+					h("button", {
+						className: "dsa-qclear",
+						disabled: Boolean(props && props.busy) || items.length === 0,
+						onClick: props && props.onClear
+					}, "清空播放列表")
+				])
+			]);
+		}
+
 		function queuePayloadForSearchItem(item) {
-			if (item && item.crossSource && typeof item.playKeyword === "string" && item.playKeyword.trim()) {
-				return { action: "add", keyword: item.playKeyword.trim() };
-			}
 			return { action: "add", songId: item && item.id };
+		}
+
+		function searchFeedbackForResponse(response) {
+			if (!response || response.ok === false || !Array.isArray(response.items) || response.items.length > 0) return null;
+			return response.guidance || "没有找到可靠的音乐结果。";
 		}
 
 		/* ---------- 微信分享面板（朋友无需安装插件） ----------
@@ -439,7 +673,10 @@ window.__ModuleLoader__.load({
 
 		/* ---------- API ---------- */
 		function getState() {
-			return fetch("/dsh-alger/state", { cache: "no-store" }).then(function (r) { return r.json(); });
+			return fetchJsonWithTimeout("/dsh-alger/state", { timeoutMs: 5000, request: { cache: "no-store" } });
+		}
+		function getQueueView() {
+			return fetchJsonWithTimeout("/dsh-alger/queue-view", { timeoutMs: 5000, request: { cache: "no-store" } });
 		}
 		function post(path, body) {
 			return fetch(path, {
@@ -451,7 +688,8 @@ window.__ModuleLoader__.load({
 		var command = function (action) { return post("/dsh-alger/command", { action: action }); };
 		var searchMusic = function (keywords, type) { return post("/dsh-alger/search", { keywords: keywords, type: type || 1, limit: 30 }); };
 		var queueApi = function (payload) { return post("/dsh-alger/queue", payload); };
-		var favoritesApi = function (payload) { return post("/dsh-alger/favorites", payload); };
+		var favoritesApi = function () { return post("/dsh-alger/favorites", {}); };
+		var removeFavoriteApi = function (songId) { return post("/dsh-alger/favorites", { action: "remove", songId: songId }); };
 		var setupApp = function (action) { return post("/dsh-alger/setup", { action: action }); };
 		var getLyric = function (id) { return post("/dsh-alger/lyric", { id: id }); };
 		var getArtist = function (id) { return post("/dsh-alger/artist", { id: id }); };
@@ -633,31 +871,45 @@ window.__ModuleLoader__.load({
 		 * 但无声」。因此本实现【只在上下文确认 running 之后才路由】；在此之前 audio
 		 * 保持原生直连扬声器，任何情况下都不会因为分析器而静音。路由后若上下文被
 		 * 挂起，则在采样与用户交互时持续尝试恢复。
-		 * @returns {function|null} 采样函数（返回 {bass,energy,vocal} 或 null）
+		 * @returns {object|null} 可暂停分析支路的控制器
 		 */
 		function attachAudioAnalyzer(audio) {
 			try {
 				if (typeof window === "undefined" || !window.AudioContext || !audio) return null;
 				var ctx = new (window.AudioContext || window.webkitAudioContext)();
 				var routed = false; // 是否已把 audio 重路由进 Web Audio 图
+				var analysisWanted = false;
+				var analysisConnected = false;
+				var src = null;
 				var analyser = null;
 				var buf = new Uint8Array(0);
 				var resumePending = false;
+				var connectAnalysis = function () {
+					if (!routed || !src || !analyser || analysisConnected || !analysisWanted) return;
+					try { src.connect(analyser); analysisConnected = true; } catch { /* 保持声音直通 */ }
+				};
+				var disconnectAnalysis = function () {
+					if (!src || !analyser || !analysisConnected) return;
+					try { src.disconnect(analyser); } catch { /* ignore */ }
+					analysisConnected = false;
+				};
 				var routeNow = function () {
 					if (routed) return;
 					try {
-						var src = ctx.createMediaElementSource(audio);
+						src = ctx.createMediaElementSource(audio);
 						analyser = ctx.createAnalyser();
 						analyser.fftSize = 256;
-						src.connect(analyser);
-						analyser.connect(ctx.destination); // 保持音频输出（重路由后必须连回 destination）
+						src.connect(ctx.destination); // 声音始终直通；分析支路可独立断开
 						buf = new Uint8Array(analyser.frequencyBinCount);
 						routed = true;
+						connectAnalysis();
 					} catch {
 						/* 路由失败（如重复路由）：保持原生输出 */
 					}
 				};
 				var resumeCtx = function () {
+					analysisWanted = true;
+					if (ctx.state === "running") { routeNow(); connectAnalysis(); return Promise.resolve(); }
 					if (ctx.state !== "suspended" || resumePending) return;
 					resumePending = true;
 					var p = ctx.resume();
@@ -674,11 +926,20 @@ window.__ModuleLoader__.load({
 						resumePending = false;
 					}
 				};
-				document.addEventListener("pointerdown", resumeCtx, true); // 用户交互恢复音频上下文
-				resumeCtx();
-				return function sample() {
+				var pointerResume = function () { if (analysisWanted) resumeCtx(); };
+				document.addEventListener("pointerdown", pointerResume, true); // 用户交互恢复音频上下文
+				return {
+				resume: resumeCtx,
+				suspend: function () { analysisWanted = false; disconnectAnalysis(); },
+				close: function () {
+					analysisWanted = false;
+					disconnectAnalysis();
+					document.removeEventListener("pointerdown", pointerResume, true);
+					try { return ctx.close(); } catch { return undefined; }
+				},
+				sample: function () {
 					if (audio.paused || audio.ended || audio.readyState < 2) return null;
-					resumeCtx(); // 未 running 时持续尝试恢复；恢复成功后才路由
+					if (!analysisWanted || !analysisConnected) return null;
 					if (!routed || !analyser || ctx.state !== "running") return null;
 					analyser.getByteFrequencyData(buf);
 					var n = buf.length;
@@ -693,6 +954,7 @@ window.__ModuleLoader__.load({
 					if (total < 1) return null;
 					var energy = total / (n * 255);
 					return { bass: bassSum / total, energy: energy, vocal: midSum / total };
+				}
 				};
 			} catch {
 				return null;
@@ -803,7 +1065,7 @@ window.__ModuleLoader__.load({
 			".dsa-btn-primary{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,rgba(255,255,255,0.95),rgba(255,255,255,0.72));color:#11131f;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,0.35)}",
 			".dsa-btn-primary:hover{filter:brightness(1.05)}",
 			".dsa-mode{font-size:10px;min-width:32px;padding:0 3px;color:rgba(255,255,255,0.85)}",
-			".dsa-mode.has-fav{color:#fca5a5}",
+			".dsa-favorites-toggle.active{background:rgba(255,255,255,.13);color:#fff}",
 			".dsa-mode-icon{width:24px;height:24px;color:rgba(255,255,255,0.8)}",
 			".dsa-shape-wrap{position:relative;display:flex;align-items:stretch;border-radius:9px;background:linear-gradient(135deg,#fbbf24,#f97316);box-shadow:0 0 10px rgba(251,146,60,0.55),0 2px 8px rgba(0,0,0,0.3);transition:filter .15s,box-shadow .15s}.dsa-shape-wrap:hover{filter:brightness(1.08);box-shadow:0 0 16px rgba(251,146,60,0.8),0 2px 10px rgba(0,0,0,0.35)}",
 			".dsa-shape{font-size:11px;font-weight:700;width:auto;min-width:42px;padding:0 7px;border-radius:9px 0 0 9px;color:#1c1200}.dsa-shape-arrow{width:22px;border-left:1px solid rgba(89,48,0,.25);border-radius:0 9px 9px 0;color:#1c1200;font-size:10px}.dsa-shape:hover,.dsa-shape-arrow:hover{background:rgba(255,255,255,.2)}",
@@ -840,16 +1102,15 @@ window.__ModuleLoader__.load({
 			".dsa-item .t{flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
 			".dsa-item .s{font-size:10px;color:rgba(255,255,255,0.6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px}",
 			".dsa-item .p{font-size:10px;color:rgba(255,255,255,0.45);flex:none}",
+			".dsa-favorites{margin-top:7px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.05);overflow:hidden}",
+			".dsa-favorites-head{height:32px;display:flex;align-items:center;gap:6px;padding:0 7px;border-bottom:1px solid rgba(255,255,255,.08)}.dsa-favorites-head strong{font-size:11px}.dsa-favorites-count{font-size:9.5px;color:rgba(255,255,255,.5)}",
+			".dsa-favorites-play,.dsa-favorites-close{width:22px;height:22px;border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.8);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}.dsa-favorites-play{font-size:9px}.dsa-favorites-play:hover,.dsa-favorites-close:hover{background:rgba(255,255,255,.13);color:#fff}.dsa-favorites-play:disabled{opacity:.3;cursor:not-allowed}.dsa-favorites-close{margin-left:auto;font-size:14px}",
+			".dsa-favorites-songs{max-height:205px;overflow-y:auto;padding:3px;scrollbar-width:thin}.dsa-favorite-row{box-sizing:border-box;width:100%;height:29px;border:0;border-radius:7px;background:transparent;color:#fff;display:flex;align-items:center;gap:6px;padding:0 6px;text-align:left;cursor:pointer}.dsa-favorite-row:hover{background:rgba(255,255,255,.1)}.dsa-favorite-row[aria-disabled=true]{cursor:default;opacity:.65}.dsa-favorite-row .n{width:20px;flex:none;font-size:9.5px;color:rgba(255,255,255,.38);text-align:right}.dsa-favorite-row .t{flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-row .s{max-width:88px;font-size:9.5px;color:rgba(255,255,255,.52);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-remove{flex:none;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.55);font-size:15px;line-height:16px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .14s,background .14s}.dsa-favorite-row:hover .dsa-favorite-remove,.dsa-favorite-remove:focus-visible{opacity:1;pointer-events:auto}.dsa-favorite-remove:hover{background:rgba(239,68,68,.2);color:#fca5a5}.dsa-favorites-empty{padding:18px 10px;text-align:center;font-size:10px;line-height:1.5;color:rgba(255,255,255,.45)}",
+			".dsa-virtual-space{position:relative;width:100%}.dsa-virtual-window{position:absolute;left:0;right:0;top:0}",
 			".dsa-notice{margin-top:7px;padding:5px 9px;border-radius:8px;font-size:11px;line-height:1.45;background:rgba(245,158,11,0.16);border:1px solid rgba(245,158,11,0.35);color:#fcd34d}",
 			".dsa-notice.ok{background:rgba(52,211,153,0.14);border-color:rgba(52,211,153,0.35);color:#6ee7b7}",
 			".dsa-notice.err{background:rgba(239,68,68,0.14);border-color:rgba(239,68,68,0.35);color:#fca5a5}",
 			".dsa-notice-action{margin-left:8px;border:0;background:transparent;color:inherit;font:inherit;font-weight:700;text-decoration:underline;cursor:pointer}",
-			".dsa-fav-panel,.dsa-fav-picker{margin-top:8px;padding:8px;border:1px solid rgba(255,255,255,.16);border-radius:11px;background:rgba(10,12,20,.86);box-shadow:0 8px 24px rgba(0,0,0,.28)}",
-			".dsa-fav-panel-head{display:flex;align-items:center;justify-content:space-between;font-size:12px}.dsa-fav-close{border:0;background:transparent;color:rgba(255,255,255,.55);cursor:pointer}",
-			".dsa-fav-tabs{display:flex;gap:4px;margin-top:7px;overflow-x:auto;padding-bottom:2px}.dsa-fav-tabs button,.dsa-fav-tools button,.dsa-fav-panel-actions button{flex:none;border:1px solid rgba(255,255,255,.16);border-radius:7px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.75);font-size:10px;padding:3px 7px;cursor:pointer}.dsa-fav-tabs button.active{border-color:#f87171;color:#fca5a5;background:rgba(239,68,68,.13)}",
-			".dsa-fav-tools{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}.dsa-fav-tools button:disabled{opacity:.35;cursor:not-allowed}",
-			".dsa-fav-songs{max-height:150px;overflow-y:auto;margin-top:6px}.dsa-fav-song{display:flex;align-items:center;gap:5px;padding:4px 3px;border-top:1px solid rgba(255,255,255,.06);font-size:10.5px}.dsa-fav-song .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-fav-song .s{max-width:70px;color:rgba(255,255,255,.48);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-fav-song button{border:0;background:transparent;color:#fca5a5;font-size:9.5px;cursor:pointer}",
-			".dsa-fav-panel-title{font-size:12px;font-weight:700;margin-bottom:6px}.dsa-fav-check{display:flex;align-items:center;gap:7px;padding:4px 2px;font-size:11px;cursor:pointer}.dsa-fav-check input{accent-color:#ef4444}.dsa-fav-empty{padding:10px 4px;text-align:center;color:rgba(255,255,255,.45);font-size:10px}.dsa-fav-panel-actions{display:flex;justify-content:flex-end;gap:5px;margin-top:7px}.dsa-fav-panel-actions button.primary{background:#ef4444;border-color:#ef4444;color:#fff}",
 			".dsa-ready{display:flex;align-items:center;gap:8px;margin-top:8px;padding:6px 9px;border-radius:9px;background:rgba(255,255,255,0.06);font-size:11px;color:rgba(255,255,255,0.8)}",
 			".dsa-ready .dot{width:8px;height:8px;border-radius:50%;flex:none}",
 			".dsa-ready .dot.ok{background:#34d399;box-shadow:0 0 6px rgba(52,211,153,0.8)}",
@@ -889,8 +1150,8 @@ window.__ModuleLoader__.load({
 			".dsa-qclear{border:none;background:transparent;color:rgba(255,255,255,0.35);font-size:9.5px;padding:2px 8px;cursor:pointer;border-radius:6px}",
 			".dsa-qclear:hover{color:rgba(255,255,255,0.6);background:rgba(255,255,255,0.06)}",
 			".dsa-qclear:disabled{opacity:0.3;cursor:not-allowed}",
-			".dsa-queue-list{max-height:130px;overflow-y:auto;padding:0 6px 6px}",
-			".dsa-qitem{display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:7px;font-size:11px;color:rgba(255,255,255,0.8);cursor:pointer}",
+			".dsa-queue-list{max-height:130px;overflow-y:auto;padding:0 6px;scrollbar-width:thin}",
+			".dsa-qitem{box-sizing:border-box;height:28px;display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:7px;font-size:11px;color:rgba(255,255,255,0.8);cursor:pointer}",
 			".dsa-qitem:hover{background:rgba(255,255,255,0.08)}",
 			".dsa-qitem.cur{background:rgba(59,130,246,0.22);color:#fff}",
 			".dsa-qitem.sel{box-shadow:inset 0 0 0 1px rgba(255,255,255,0.5);background:rgba(255,255,255,0.12);color:#fff}",
@@ -1050,6 +1311,7 @@ window.__ModuleLoader__.load({
 		function MusicPlayer() {
 			var [state, setState] = React.useState(null);
 			var stateRef = React.useRef(null); // 供 audio 事件回调读取最新状态（避免闭包过期）
+			var stateSignatureRef = React.useRef(null);
 			stateRef.current = state;
 			var [petId, setPetId] = React.useState(function () { return readStoredMoonyId(getLocalStorage()); });
 			var [autoMatch, setAutoMatch] = React.useState(function () { return readAutoMatch(getLocalStorage()); });
@@ -1103,19 +1365,19 @@ window.__ModuleLoader__.load({
 			var [searching, setSearching] = React.useState(false);
 			var [results, setResults] = React.useState(null);
 			var [queueOpen, setQueueOpen] = React.useState(false);
+			var [queueView, setQueueView] = React.useState(null);
 			var [selectedIdx, setSelectedIdx] = React.useState(null); // 播放列表"单击选中"的行
 			var [favOptimistic, setFavOptimistic] = React.useState(null); // 收藏乐观状态（null=跟随真实状态）
 			var [favoritesOpen, setFavoritesOpen] = React.useState(false);
-			var [favoriteData, setFavoriteData] = React.useState(null);
-			var [activeFavoriteId, setActiveFavoriteId] = React.useState("all");
-			var [membershipSong, setMembershipSong] = React.useState(null);
-			var heartTimerRef = React.useRef(null);
-			var heartTriggeredRef = React.useRef(false);
+			var [favoriteSongs, setFavoriteSongs] = React.useState(null);
+			var [favoriteRevision, setFavoriteRevision] = React.useState(null);
+			var [favoritesLoading, setFavoritesLoading] = React.useState(false);
 			// 关闭/激活与侧边栏开关按钮共享（pub/sub）
 			var [hidden, setHidden] = React.useState(petVis.hidden);
 			React.useEffect(function () { return onPetHidden(setHidden); }, []);
 			var [notice, setNotice] = React.useState(null); // {kind:'ok'|'err'|'', text}
 			var [busy, setBusy] = React.useState(false);
+			var [recommendBusy, setRecommendBusy] = React.useState(false);
 			var recommendRequestRef = React.useRef(0);
 			var [lrc, setLrc] = React.useState(null); // [{t,text}] 当前歌歌词
 			var [lyricsOpen, setLyricsOpen] = React.useState(false); // 展开视图歌词面板
@@ -1136,21 +1398,66 @@ window.__ModuleLoader__.load({
 				noticeTimer.current = setTimeout(function () { setNotice(null); }, 6000);
 			};
 
-			var refresh = React.useCallback(function () {
-				getState().then(function (s) { setState(s); }).catch(function () { /* 忽略瞬时失败 */ });
+			var pollContextRef = React.useRef({ collapsed: collapsed, hidden: hidden });
+			pollContextRef.current = { collapsed: collapsed, hidden: hidden };
+			var statePollerRef = React.useRef(null);
+			var requestState = React.useCallback(function () {
+				return getState().then(function (s) {
+					var signature = compactStateSignature(s);
+					if (signature !== stateSignatureRef.current) {
+						stateSignatureRef.current = signature;
+						setState(s);
+					}
+					return s;
+				});
 			}, []);
+			var refresh = React.useCallback(function () {
+				if (statePollerRef.current) return statePollerRef.current.refresh();
+				return requestState().catch(function () { /* 忽略瞬时失败 */ });
+			}, [requestState]);
 
-			// 轮询
+			// 单飞自适应轮询：展开态及时，收起/隐藏/后台态降频；可见性变化立即同步一次。
 			React.useEffect(function () {
-				refresh();
-				var timer = setInterval(refresh, POLL_MS);
-				return function () { clearInterval(timer); };
-			}, [refresh]);
+				var poller = createStatePoller({
+					request: requestState,
+					getDelay: function () {
+						return statePollDelay({
+							collapsed: pollContextRef.current.collapsed,
+							hidden: pollContextRef.current.hidden,
+							documentHidden: typeof document !== "undefined" && Boolean(document.hidden)
+						});
+					}
+				});
+				statePollerRef.current = poller;
+				var onVisibility = function () { poller.refresh(); };
+				if (typeof document !== "undefined" && document.addEventListener) document.addEventListener("visibilitychange", onVisibility);
+				poller.start();
+				return function () {
+					if (typeof document !== "undefined" && document.removeEventListener) document.removeEventListener("visibilitychange", onVisibility);
+					poller.stop();
+					if (statePollerRef.current === poller) statePollerRef.current = null;
+				};
+			}, [requestState]);
+
+			// 播放列表仅在面板打开且 revision 过期时加载完整行数据。
+			React.useEffect(function () {
+				var remoteRevision = state && state.queue ? state.queue.revision : null;
+				var cachedRevision = queueView ? queueView.revision : null;
+				if (!shouldReloadCollection(cachedRevision, remoteRevision, queueOpen)) return;
+				var cancelled = false;
+				getQueueView().then(function (view) {
+					if (!cancelled && view && view.ok !== false) setQueueView(view);
+				}).catch(function (error) {
+					if (!cancelled) flash("err", (error && error.message) || "读取播放列表失败");
+				});
+				return function () { cancelled = true; };
+			}, [queueOpen, state && state.queue && state.queue.revision, queueView && queueView.revision]);
 
 			// ---------- 内置 <audio> 播放引擎 ----------
 			// 服务端状态机是唯一事实来源：轮询发现 currentUrl 变化就切换播放；
 			// 音频事件（进度/结束/播放状态）定时上报回服务端。
 			var audioRef = React.useRef(null);
+			var playbackReporterRef = React.useRef(null);
 			var lastUrlRef = React.useRef(null); // 已加载的直链，避免重复播放
 			var lastSongIdRef = React.useRef(null); // 已识别的歌曲（听歌记忆重播检测）
 			var saidSongRef = React.useRef(null); // 已开口说过的歌曲（每首只说一次）
@@ -1163,16 +1470,33 @@ window.__ModuleLoader__.load({
 				var audio = document.createElement("audio");
 				audio.style.display = "none";
 				document.body.appendChild(audio);
+				var reporter = createPlaybackReporter({
+					intervalMs: 5000,
+					read: function () {
+						return {
+							position: audio.currentTime || 0,
+							duration: audio.duration || 0,
+							playing: !audio.paused && !audio.ended,
+							ready: true
+						};
+					},
+					send: reportPlayback
+				});
+				playbackReporterRef.current = reporter;
 				var syncProg = function () {
 					if (seekingRef.current) return;
 					setProg({ pos: audio.currentTime || 0, dur: audio.duration || 0 });
 				};
 				audio.addEventListener("timeupdate", syncProg);
 				audio.addEventListener("durationchange", syncProg);
-				audio.addEventListener("loadedmetadata", syncProg);
+				audio.addEventListener("loadedmetadata", function () { syncProg(); reporter.checkpoint(); });
+				audio.addEventListener("play", function () { reporter.setPlaying(true); syncAnalyzerLifecycle(); });
+				audio.addEventListener("pause", function () { reporter.setPlaying(false); syncAnalyzerLifecycle(); });
+				audio.addEventListener("seeked", function () { reporter.checkpoint(); });
 				audio.addEventListener("ended", function () {
 					// 自然结束：按播放模式处理（单曲循环本地重播；列表循环/随机交给服务端 next）
-					reportPlayback({ playing: false, position: 0, duration: audio.duration || 0, ready: true });
+					reporter.setPlaying(false);
+					syncAnalyzerLifecycle();
 					var mode = stateRef.current && typeof stateRef.current.playMode === "number" ? stateRef.current.playMode : 0;
 					if (mode === 1) {
 						try { audio.currentTime = 0; var rp = audio.play(); if (rp && typeof rp.catch === "function") rp.catch(function () {}); } catch { /* ignore */ }
@@ -1181,7 +1505,8 @@ window.__ModuleLoader__.load({
 					command("next").then(function () { setTimeout(refresh, 300); }).catch(function () {});
 				});
 				audio.addEventListener("error", function () {
-					reportPlayback({ playing: false, position: 0, duration: audio.duration || 0, ready: true });
+					reporter.setPlaying(false);
+					syncAnalyzerLifecycle();
 				});
 				var unbindBuffering = bindAudioBuffering(audio, setBuffering);
 				audioRef.current = audio;
@@ -1189,10 +1514,12 @@ window.__ModuleLoader__.load({
 				// 开启时（含页面加载后勾选）由 ensureAnalyzer 挂载。
 				if (readAutoMatch(getLocalStorage())) ensureAnalyzer();
 				return function () {
-					if (analyzerTimerRef.current) clearInterval(analyzerTimerRef.current);
-					analyzerTimerRef.current = null;
+					if (analyzerLifecycleRef.current) analyzerLifecycleRef.current.dispose();
+					analyzerLifecycleRef.current = null;
 					analyzerRef.current = null;
 					unbindBuffering();
+					reporter.dispose();
+					if (playbackReporterRef.current === reporter) playbackReporterRef.current = null;
 					try { audio.pause(); audio.src = ""; } catch { /* ignore */ }
 					if (audio.parentNode) audio.parentNode.removeChild(audio);
 					audioRef.current = null;
@@ -1231,8 +1558,18 @@ window.__ModuleLoader__.load({
 			var stableCountRef = React.useRef(0);
 			var currentSongRef = React.useRef(null); // 当前分析中的歌曲（切歌时重置）
 			var recentRef = React.useRef([]); // 最近几次采样（取能量最高者当特征，前奏的低能量采样会被主旋律覆盖）
-			var analyzerRef = React.useRef(null); // 已挂载的采样函数（createMediaElementSource 对同一元素只能调一次）
-			var analyzerTimerRef = React.useRef(null);
+			var analyzerRef = React.useRef(null); // 已挂载的分析控制器（createMediaElementSource 对同一元素只能调一次）
+			var analyzerLifecycleRef = React.useRef(null);
+			var syncAnalyzerLifecycle = function () {
+				var audio = audioRef.current;
+				var lifecycle = analyzerLifecycleRef.current;
+				if (!lifecycle) return;
+				lifecycle.update({
+					enabled: Boolean(autoMatchRef.current),
+					playing: Boolean(audio && !audio.paused && !audio.ended),
+					visible: typeof document === "undefined" || !document.hidden
+				});
+			};
 			// 惰性挂载音频分析器并启动采样定时器。行为：识别到稳定风格后
 			// 识别到稳定风格后【直接切换】宠物并开口说明（不询问——开启自动匹配即代表授权）。
 			// 即时性：不跳过前奏——音频数据就绪即采样（800ms 间隔），连续 2 次
@@ -1242,11 +1579,16 @@ window.__ModuleLoader__.load({
 				var audio = audioRef.current;
 				if (!audio || analyzerRef.current) return;
 				if (typeof window === "undefined" || !window.AudioContext) return;
-				var sampleAudio = attachAudioAnalyzer(audio);
-				if (!sampleAudio) return;
-				analyzerRef.current = sampleAudio;
-				analyzerTimerRef.current = setInterval(function () {
-					if (!autoMatchRef.current) return;
+				var analyzer = attachAudioAnalyzer(audio);
+				if (!analyzer) return;
+				analyzerRef.current = analyzer;
+				analyzerLifecycleRef.current = createAnalyzerLifecycle({
+					intervalMs: 800,
+					resume: analyzer.resume,
+					suspend: analyzer.suspend,
+					close: analyzer.close,
+					sample: analyzer.sample,
+					onSample: function (feat) {
 					var song = stateRef.current && stateRef.current.playing ? stateRef.current.playing.song : null;
 					if (!song || !audio.src) return;
 					// 切歌时重置候选与推荐，避免旧歌特征误匹配新歌
@@ -1257,8 +1599,6 @@ window.__ModuleLoader__.load({
 						recentRef.current = [];
 												return;
 					}
-					var feat = sampleAudio();
-					if (!feat) return;
 					recentRef.current.push(feat);
 					if (recentRef.current.length > 3) recentRef.current.shift();
 					// 取能量最高的采样作为当前特征（前奏铺垫能量低，会被主旋律覆盖）
@@ -1275,13 +1615,21 @@ window.__ModuleLoader__.load({
 						stableCountRef.current = 0;
 						applyPetSwitch(target); // 直接切换，不询问（用户已授权自动匹配）
 					}
-				}, 800);
+					}
+				});
+				syncAnalyzerLifecycle();
 			};
 			// 自动匹配开关变化：开启时确保分析器挂载（修复「勾选后不生效」——
 			// 分析器不再只在页面加载时按初始状态挂载）；关闭时清掉当前推荐
 			React.useEffect(function () {
 				if (autoMatch) ensureAnalyzer();
+				syncAnalyzerLifecycle();
 			}, [autoMatch]);
+			React.useEffect(function () {
+				var onVisibility = function () { syncAnalyzerLifecycle(); };
+				document.addEventListener("visibilitychange", onVisibility);
+				return function () { document.removeEventListener("visibilitychange", onVisibility); };
+			}, []);
 
 			var seekEndTimerRef = React.useRef(null);
 			var seekToRef = React.useRef(null); // 系统媒体键 seek 回调（避免闭包过期）
@@ -1348,29 +1696,6 @@ window.__ModuleLoader__.load({
 				}
 			}, [state]);
 
-			// 进度上报（2s 一次，供服务端状态/模型读取）
-			React.useEffect(function () {
-				var timer = setInterval(function () {
-					var audio = audioRef.current;
-					if (!audio) return;
-					reportPlayback({
-						position: audio.currentTime || 0,
-						duration: audio.duration || 0,
-						playing: !audio.paused && !audio.ended,
-						ready: true
-					});
-				}, 2000);
-				return function () { clearInterval(timer); };
-			}, []);
-
-			// 听歌记忆：深夜提醒轮询（服务端判定并设置宠物通知，客户端 60s 问一次）
-			React.useEffect(function () {
-				var timer = setInterval(function () {
-					post("/dsh-alger/habits", { action: "night" }).catch(function () {});
-				}, 60000);
-				return function () { clearInterval(timer); };
-			}, []);
-
 			// 恢复位置 / 默认右下角
 			React.useEffect(function () {
 				try {
@@ -1385,18 +1710,25 @@ window.__ModuleLoader__.load({
 				setPos(null);
 			}, []);
 
-			// 视口内钳制（仅展开态生效：收起态宠物锚点不受展开卡尺寸影响，否则会被每轮轮询往左拽）
+			// 视口内钳制仅响应真实布局变化，不再随每轮服务端状态刷新读取布局。
 			React.useEffect(function () {
 				if (collapsed) return;
-				var height = cardRef.current ? cardRef.current.offsetHeight : 260;
-				var p = posRef.current;
-				if (!p) return;
-				var clamped = {
-					x: Math.max(4, Math.min(window.innerWidth - WIDTH - 4, p.x)),
-					y: Math.max(4, Math.min(window.innerHeight - height - 4, p.y))
+				var clamp = function () {
+					var height = cardRef.current ? cardRef.current.offsetHeight : 260;
+					var p = posRef.current;
+					if (!p) return;
+					var clamped = {
+						x: Math.max(4, Math.min(window.innerWidth - WIDTH - 4, p.x)),
+						y: Math.max(4, Math.min(window.innerHeight - height - 4, p.y))
+					};
+					if (clamped.x !== p.x || clamped.y !== p.y) { posRef.current = clamped; setPos(clamped); }
 				};
-				if (clamped.x !== p.x || clamped.y !== p.y) { posRef.current = clamped; setPos(clamped); }
-			}, [collapsed, state]);
+				clamp();
+				window.addEventListener("resize", clamp);
+				var observer = typeof ResizeObserver !== "undefined" && cardRef.current ? new ResizeObserver(clamp) : null;
+				if (observer) observer.observe(cardRef.current);
+				return function () { window.removeEventListener("resize", clamp); if (observer) observer.disconnect(); };
+			}, [collapsed]);
 
 			// 拖动
 			var onDragStart = function (event) {
@@ -1463,6 +1795,7 @@ window.__ModuleLoader__.load({
 				command("toggle-favorite").then(function (r) {
 					if (r && r.ok === false) { setFavOptimistic(null); flash("err", r.error || "收藏失败"); return; }
 					setTimeout(refresh, 300);
+					if (favoritesOpen) setTimeout(loadFavorites, 300);
 				}).catch(function () { setFavOptimistic(null); flash("err", "收藏失败"); });
 			};
 
@@ -1477,100 +1810,83 @@ window.__ModuleLoader__.load({
 			// 推荐播放：不知道听什么时一键推荐
 			var onRecommend = function () {
 				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
+				if (!state.recommendation || !state.recommendation.ready) { flash("", "推荐正在准备中"); return; }
 				var requestId = "recommend-" + Date.now() + "-" + (recommendRequestRef.current + 1);
 				recommendRequestRef.current = requestId;
-				setBusy(true);
+				setFavoritesOpen(false);
+				setQueueOpen(true);
+				setResults(null);
+				setSearched(false);
+				setSelectedIdx(null);
+				setRecommendBusy(true);
 				post("/dsh-alger/recommend", { requestId: requestId }).then(function (r) {
 					if (recommendRequestRef.current !== requestId) return;
-					setBusy(false);
-					if (r && !r.ok) flash("err", (r && r.guidance) || (r && r.error) || "推荐失败");
-					// 成功时结果由宠物气泡播报（服务端 notice）
-					setTimeout(refresh, 600);
+					setRecommendBusy(false);
+					if (r && !r.ok) flash(r.preparing ? "" : "err", (r && r.guidance) || (r && r.error) || "推荐失败");
+					setTimeout(refresh, 120);
 				}).catch(function () {
 					if (recommendRequestRef.current !== requestId) return;
-					setBusy(false);
+					setRecommendBusy(false);
 					flash("err", "推荐失败");
 				});
 			};
 
-			var loadFavoriteCollection = function (collectionId) {
-				var id = collectionId || "all";
-				setActiveFavoriteId(id);
-				return favoritesApi({ action: "list", collectionId: id }).then(function (r) {
+			var loadFavorites = function () {
+				setFavoritesLoading(true);
+				return favoritesApi().then(function (r) {
+					setFavoritesLoading(false);
 					if (!r || r.ok === false) throw new Error((r && r.error) || "读取收藏失败");
-					setFavoriteData(r);
+					setFavoriteSongs(r.songs || []);
+					setFavoriteRevision(r.revision === undefined ? null : r.revision);
 					return r;
+				}).catch(function (error) {
+					setFavoritesLoading(false);
+					throw error;
 				});
 			};
-			var openFavorites = function () {
+			React.useEffect(function () {
+				var remoteRevision = state && state.favorites ? state.favorites.revision : null;
+				if (!shouldReloadCollection(favoriteRevision, remoteRevision, favoritesOpen)) return;
+				loadFavorites().catch(function (error) { flash("err", error.message || "读取收藏失败"); });
+			}, [favoritesOpen, favoriteRevision, state && state.favorites && state.favorites.revision]);
+			var toggleFavorites = function () {
+				if (favoritesOpen) { setFavoritesOpen(false); return; }
 				setFavoritesOpen(true);
-				setMembershipSong(null);
-				loadFavoriteCollection(activeFavoriteId).catch(function (error) { flash("err", error.message || "读取收藏失败"); });
+				setQueueOpen(false);
+				setResults(null);
+				setSearched(false);
 			};
-			var openMemberships = function (song) {
-				if (!song) return;
-				favoritesApi({ action: "list", collectionId: activeFavoriteId }).then(function (r) {
-					if (!r || r.ok === false) throw new Error((r && r.error) || "读取收藏失败");
-					setFavoriteData(r);
-					setMembershipSong(song);
-				}).catch(function (error) { flash("err", error.message || "读取收藏失败"); });
-			};
-			var saveMemberships = function (collectionIds) {
-				if (!membershipSong) return;
-				favoritesApi({ action: "set-memberships", songId: membershipSong.id, collectionIds: collectionIds }).then(function (r) {
-					if (!r || r.ok === false) throw new Error((r && r.error) || "整理收藏失败");
-					setMembershipSong(null);
-					setFavOptimistic(true);
-					setTimeout(function () { setFavOptimistic(null); }, 2500);
-					if (favoritesOpen) loadFavoriteCollection(activeFavoriteId);
-					setTimeout(refresh, 300);
-				}).catch(function (error) { flash("err", error.message || "整理收藏失败"); });
-			};
-			var playFavoriteCollection = function (collectionId) {
+			// 播放全部或从收藏中的指定歌曲开始；收藏面板保持打开。
+			var playFavoritesFrom = function (index) {
+				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
 				setBusy(true);
-				favoritesApi({ action: "play", collectionId: collectionId }).then(function (r) {
+				queueApi({ action: "favorites", favoriteIndex: index || 0 }).then(function (r) {
 					setBusy(false);
 					if (!r || r.ok === false) { flash("err", (r && r.guidance) || (r && r.error) || "播放收藏失败"); return; }
-					setFavoritesOpen(false);
-					setQueueOpen(true);
 					setTimeout(refresh, 500);
 				}).catch(function () { setBusy(false); flash("err", "播放收藏失败"); });
 			};
-			var createFavoriteCollection = function () {
-				var name = typeof window.prompt === "function" ? window.prompt("新收藏目录名称") : "";
-				if (!name || !name.trim()) return;
-				favoritesApi({ action: "create", name: name }).then(function (r) {
-					if (!r || r.ok === false) throw new Error((r && r.error) || "新建失败");
-					return loadFavoriteCollection(r.collection.id);
-				}).catch(function (error) { flash("err", error.message || "新建失败"); });
+			var removeFavorite = function (song) {
+				if (!song || !Number.isFinite(Number(song.id))) return;
+				var previous = favoriteSongs || [];
+				setFavoriteSongs(previous.filter(function (item) { return Number(item.id) !== Number(song.id); }));
+				removeFavoriteApi(song.id).then(function (r) {
+					if (!r || r.ok === false) throw new Error((r && r.error) || "取消收藏失败");
+					setFavoriteSongs(r.songs || []);
+					setFavoriteRevision(r.revision === undefined ? null : r.revision);
+					setTimeout(refresh, 120);
+				}).catch(function (error) {
+					setFavoriteSongs(previous);
+					flash("err", error.message || "取消收藏失败");
+				});
 			};
-			var renameFavoriteCollection = function (collection) {
-				var name = typeof window.prompt === "function" ? window.prompt("重命名收藏目录", collection.name) : "";
-				if (!name || !name.trim() || name.trim() === collection.name) return;
-				favoritesApi({ action: "rename", collectionId: collection.id, name: name }).then(function (r) {
-					if (!r || r.ok === false) throw new Error((r && r.error) || "重命名失败");
-					return loadFavoriteCollection(collection.id);
-				}).catch(function (error) { flash("err", error.message || "重命名失败"); });
-			};
-			var deleteFavoriteCollection = function (collection) {
-				if (typeof window.confirm === "function" && !window.confirm("删除目录“" + collection.name + "”？歌曲仍保留在全部收藏中。")) return;
-				favoritesApi({ action: "delete", collectionId: collection.id }).then(function (r) {
-					if (!r || r.ok === false) throw new Error((r && r.error) || "删除失败");
-					return loadFavoriteCollection("all");
-				}).catch(function (error) { flash("err", error.message || "删除失败"); });
-			};
-			var heartHandlers = createLongPressHandlers({
-				timerRef: heartTimerRef,
-				triggeredRef: heartTriggeredRef,
-				onLongPress: function () { openMemberships(playing); },
-				onClick: onToggleFavorite
-			});
 
 			var onSearch = function (forcedType) {
 				var q = query.trim();
 				if (!q) return;
 				// 展开搜索时收起播放列表，给搜索结果腾空间（搜索区在播放列表上方）
 				setQueueOpen(false);
+				setFavoritesOpen(false);
 				// 切换 tab 重搜时显式传 type，避免 setTimeout 闭包捕获旧的 searchType 导致搜错类型
 				var t = typeof forcedType === "number" ? forcedType : searchType;
 				setSearched(true);
@@ -1580,6 +1896,8 @@ window.__ModuleLoader__.load({
 					setSearching(false);
 					if (!r || r.ok === false) { flash("err", (r && r.error) || "搜索失败"); setResults(null); return; }
 					setResults(r.items || []);
+					var searchFeedback = searchFeedbackForResponse(r);
+					if (searchFeedback) flash("err", searchFeedback);
 				}).catch(function () { setSearching(false); flash("err", "搜索失败"); });
 			};
 
@@ -1979,12 +2297,17 @@ window.__ModuleLoader__.load({
 						// 传输控制（含收藏）
 						h("div", { className: "dsa-controls" }, [
 							h("button", {
-								className: "dsa-btn dsa-mode" + (state && state.favoriteCount > 0 ? " has-fav" : ""),
-								title: "打开收藏列表（" + (state && state.favoriteCount ? state.favoriteCount + " 首" : "暂无收藏") + "）",
+								className: "dsa-btn dsa-mode dsa-favorites-toggle" + (favoritesOpen ? " active" : ""),
+								title: "查看收藏（" + (state && state.favoriteCount ? state.favoriteCount + " 首" : "暂无收藏") + "）",
 								disabled: !canControl || busy,
-								onClick: openFavorites
+								onClick: toggleFavorites
 							}, "收藏"),
-							h("button", { className: "dsa-btn dsa-mode", title: "推荐播放（不知道听什么时用）", disabled: !canControl || busy, onClick: onRecommend }, "推荐"),
+							h("button", {
+								className: "dsa-btn dsa-mode",
+								title: state && state.recommendation && state.recommendation.ready ? "立即推荐 30 首并播放" : "后台正在准备推荐",
+								disabled: !canControl || busy || recommendBusy || !(state && state.recommendation && state.recommendation.ready),
+								onClick: onRecommend
+							}, "推荐"),
 														h("button", { className: "dsa-btn", title: "上一首", disabled: !canControl, onClick: function () { runCommand("prev"); } }, ICONS.prev),
 							h("button", {
 								className: "dsa-btn dsa-btn-primary",
@@ -1993,16 +2316,11 @@ window.__ModuleLoader__.load({
 								onClick: function () { runCommand("toggle-play"); }
 							}, isPlaying ? ICONS.pause : ICONS.play),
 							h("button", { className: "dsa-btn", title: "下一首", disabled: !canControl, onClick: function () { runCommand("next"); } }, ICONS.next),
-							h("button", {
-								className: "dsa-btn dsa-fav" + ((favOptimistic !== null ? favOptimistic : Boolean(state && state.favorite)) ? " active" : ""),
-								title: "单击收藏/取消收藏；长按整理到目录",
+							h(FavoriteHeartButton, {
+								active: favOptimistic !== null ? favOptimistic : Boolean(state && state.favorite),
 								disabled: !canControl || !playing,
-								onPointerDown: heartHandlers.onPointerDown,
-								onPointerUp: heartHandlers.onPointerUp,
-								onPointerLeave: heartHandlers.onPointerLeave,
-								onPointerCancel: heartHandlers.onPointerCancel,
-								onClick: heartHandlers.onClick
-							}, "♥"),
+								onToggle: onToggleFavorite
+							}),
 							h("button", {
 								className: "dsa-btn dsa-mode-icon",
 								title: "播放模式：单击切换（列表循环 / 单曲循环 / 随机）",
@@ -2074,7 +2392,7 @@ window.__ModuleLoader__.load({
 								value: query,
 								disabled: busy,
 								onChange: function (e) { setQuery(e.target.value); },
-								onFocus: function () { setQueueOpen(false); }, // 聚焦搜索：收起播放列表
+								onFocus: function () { setQueueOpen(false); setFavoritesOpen(false); }, // 聚焦搜索：收起其他列表
 								onKeyDown: onSearchKey
 							}),
 							h("button", {
@@ -2136,52 +2454,35 @@ window.__ModuleLoader__.load({
 									})
 								])
 							: null,
-						favoritesOpen && favoriteData && !membershipSong ? h(FavoriteCollectionPanel, {
-							collections: favoriteData.collections,
-							activeId: activeFavoriteId,
-							songs: favoriteData.songs,
-							onClose: function () { setFavoritesOpen(false); setMembershipSong(null); },
-							onSelect: function (id) { loadFavoriteCollection(id).catch(function (error) { flash("err", error.message || "读取收藏失败"); }); },
-							onPlay: playFavoriteCollection,
-							onCreate: createFavoriteCollection,
-							onRename: renameFavoriteCollection,
-							onDelete: deleteFavoriteCollection,
-							onOrganize: openMemberships
-						}) : null,
-						membershipSong && favoriteData ? h(FavoriteMembershipPicker, {
-							song: membershipSong,
-							collections: favoriteData.collections,
-							onSave: saveMemberships,
-							onClose: function () { setMembershipSong(null); }
+						favoritesOpen ? h(FavoriteListPanel, {
+							songs: favoriteSongs || [],
+							loading: favoritesLoading,
+							busy: busy,
+							onPlayAll: function () { playFavoritesFrom(0); },
+							onPlayFrom: playFavoritesFrom,
+							onRemove: removeFavorite,
+							onClose: function () { setFavoritesOpen(false); }
 						}) : null,
 						// 播放列表
-						state && state.queue && Array.isArray(state.queue.items)
+						!favoritesOpen && state && state.queue
 							? h("div", { className: "dsa-queue" }, [
 									h("div", { className: "dsa-queue-title", onClick: function () { setQueueOpen(!queueOpen); } }, [
 										h("span", null, "播放列表"),
-										h("span", { className: "cnt" }, "(" + state.queue.items.length + " 首)"),
+										h("span", { className: "cnt" }, "(" + (state.queue.count || 0) + " 首)"),
 										h("span", { className: "fold" }, queueOpen ? "▾" : "▸")
 									]),
 									queueOpen
-									? h("div", { className: "dsa-queue-list" }, [
-											state.queue.items.map(function (item, i) {
-												return h(QueueSongRow, {
-													key: item.id + "-" + i, item: item, index: i,
-													current: i === state.queue.index,
-													selected: i === selectedIdx,
-													onSelect: onQueueSelect,
-													onJump: onQueueJump,
-													onRemove: onQueueRemove
-												});
-											}),
-												h("div", { className: "dsa-qclear-row" }, [
-													h("button", {
-														className: "dsa-qclear",
-														disabled: busy || state.queue.items.length === 0,
-														onClick: onQueueClear
-													}, "清空播放列表")
-												])
-											])
+									? h(QueueListPanel, {
+										items: queueView && Array.isArray(queueView.items) ? queueView.items : [],
+										loading: !(queueView && Array.isArray(queueView.items)),
+										currentIndex: state.queue.index,
+										selectedIndex: selectedIdx,
+										busy: busy,
+										onSelect: onQueueSelect,
+										onJump: onQueueJump,
+										onRemove: onQueueRemove,
+										onClear: onQueueClear
+									})
 										: null
 								])
 							: null,
@@ -2243,6 +2544,14 @@ window.__ModuleLoader__.load({
 		exports.apply = apply;
 		exports.inject = inject;
 		exports.name = "@dongfang81/dsh-music";
+		exports.statePollDelay = statePollDelay;
+		exports.createStatePoller = createStatePoller;
+		exports.fetchJsonWithTimeout = fetchJsonWithTimeout;
+		exports.compactStateSignature = compactStateSignature;
+		exports.shouldReloadCollection = shouldReloadCollection;
+		exports.virtualWindow = virtualWindow;
+		exports.createPlaybackReporter = createPlaybackReporter;
+		exports.createAnalyzerLifecycle = createAnalyzerLifecycle;
 		exports.parseLrc = parseLrc;
 		exports.karaokeProgress = karaokeProgress;
 		exports.syncMediaSession = syncMediaSession;
@@ -2261,11 +2570,12 @@ window.__ModuleLoader__.load({
 		exports.resolveMoonyState = resolveMoonyState;
 		exports.MoonyPet = MoonyPet;
 		exports.MoonyPicker = MoonyPicker;
-		exports.createLongPressHandlers = createLongPressHandlers;
-		exports.FavoriteCollectionPanel = FavoriteCollectionPanel;
-		exports.FavoriteMembershipPicker = FavoriteMembershipPicker;
+		exports.FavoriteHeartButton = FavoriteHeartButton;
+		exports.FavoriteListPanel = FavoriteListPanel;
 		exports.QueueSongRow = QueueSongRow;
+		exports.QueueListPanel = QueueListPanel;
 		exports.queuePayloadForSearchItem = queuePayloadForSearchItem;
+		exports.searchFeedbackForResponse = searchFeedbackForResponse;
 		return module.exports;
 	}
 });

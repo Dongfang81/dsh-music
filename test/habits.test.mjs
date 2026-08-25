@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { unlink } from 'node:fs/promises';
+import { mkdir as realMkdir, readFile, unlink, writeFile as realWriteFile } from 'node:fs/promises';
 import { createHabits } from '../lib/habits.js';
 
 const song = (id, name = 'Song' + id, artists = 'Artist') => ({ id, name, artists, album: 'Album' });
@@ -181,5 +181,73 @@ test('habits persist to disk and reload', async () => {
 	assert.equal(s.totalSongs, 1);
 	assert.equal(s.totalSeconds, 45);
 	assert.equal(s.topSongs[0].name, 'Song1');
+	await unlink(file).catch(() => {});
+});
+
+test('unchanged paused reports do not rewrite the habits file', async () => {
+	const file = join(tmpdir(), 'moony-habits-idle-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.json');
+	let current = new Date(2026, 7, 21, 10, 0, 0).getTime();
+	const habits = createHabits({ file, now: () => current, saveDelayMs: 15 });
+	await habits.recordPlayback({ song: song(1), position: 0, duration: 300, playing: true });
+	await habits.flush();
+	const first = JSON.parse(await readFile(file, 'utf8'));
+
+	current += 5000;
+	await habits.recordPlayback({ song: song(1), position: 0, duration: 300, playing: false });
+	await new Promise((resolve) => setTimeout(resolve, 330));
+	const second = JSON.parse(await readFile(file, 'utf8'));
+
+	assert.equal(second.updatedAt, first.updatedAt);
+	await unlink(file).catch(() => {});
+});
+
+test('playing progress batches disk persistence until its configured save window', async () => {
+	const file = join(tmpdir(), 'moony-habits-batch-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.json');
+	let current = new Date(2026, 7, 21, 10, 0, 0).getTime();
+	const habits = createHabits({ file, now: () => current, saveDelayMs: 40 });
+	await habits.recordPlayback({ song: song(1), position: 0, duration: 300, playing: true });
+	current += 2000;
+	await habits.recordPlayback({ song: song(1), position: 2, duration: 300, playing: true });
+	current += 2000;
+	await habits.recordPlayback({ song: song(1), position: 4, duration: 300, playing: true });
+
+	await new Promise((resolve) => setTimeout(resolve, 70));
+	const saved = JSON.parse(await readFile(file, 'utf8'));
+	assert.equal(saved.songs['1'].seconds, 4);
+	assert.equal(saved.updatedAt, current);
+	await unlink(file).catch(() => {});
+});
+
+test('progress received during an active write remains dirty for the next flush', async () => {
+	const file = join(tmpdir(), 'moony-habits-concurrent-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.json');
+	let releaseWrite;
+	let markWriteStarted;
+	const writeStarted = new Promise((resolve) => { markWriteStarted = resolve; });
+	let writes = 0;
+	const habits = createHabits({
+		file,
+		saveDelayMs: 10000,
+		fs: {
+			readFile,
+			mkdir: realMkdir,
+			async writeFile(path, value) {
+				writes += 1;
+				markWriteStarted();
+				if (writes === 1) await new Promise((resolve) => { releaseWrite = resolve; });
+				return realWriteFile(path, value);
+			}
+		}
+	});
+	await habits.recordPlayback({ song: song(1), position: 0, duration: 300, playing: true });
+	const firstFlush = habits.flush();
+	await writeStarted;
+	assert.equal(writes, 1);
+	await habits.recordPlayback({ song: song(1), position: 2, duration: 300, playing: true });
+	releaseWrite();
+	await firstFlush;
+	await habits.flush();
+	const saved = JSON.parse(await readFile(file, 'utf8'));
+	assert.equal(saved.songs['1'].seconds, 2);
+	assert.equal(writes, 2);
 	await unlink(file).catch(() => {});
 });
