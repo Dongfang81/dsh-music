@@ -143,22 +143,28 @@ test('generation passes cancellation through candidate collection and stops clea
 	const dir = await mkdtemp(join(tmpdir(), 'moony-cancel-generator-'));
 	const pool = createRecommendationPool({ file: join(dir, 'pool.json') });
 	let receivedSignal = null;
+	let markCollectorStarted;
+	const collectorStarted = new Promise((resolve) => { markCollectorStarted = resolve; });
 	const generator = createRecommendationGenerator({
 		pool,
 		player: { current: () => null, state: { queue: [] } },
 		profile: { snapshot: async () => ({ tracks: {}, artists: {}, rules: [], resolverStats: {} }) },
 		collectCandidates: async ({ signal }) => {
 			receivedSignal = signal;
+			markCollectorStarted();
 			return new Promise((resolve, reject) => {
-				signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
-				setTimeout(() => reject(new Error('cancellation did not reach collector')), 20);
+				const timeout = setTimeout(() => reject(new Error('cancellation did not reach collector')), 200);
+				signal?.addEventListener('abort', () => {
+					clearTimeout(timeout);
+					reject(signal.reason);
+				}, { once: true });
 			});
 		},
 		resolver: { resolve: async () => null }
 	});
 	const controller = new AbortController();
 	const pending = generator.generate({ reasons: ['favorite'], signal: controller.signal });
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	await collectorStarted;
 	controller.abort(new Error('generation cancelled'));
 	const result = await pending;
 	assert.equal(receivedSignal, controller.signal);
