@@ -45,7 +45,7 @@ test('recommend route invokes the cached recommendation action directly', async 
 	assert.equal(res.body.requestId, 'button-1');
 });
 
-test('recommend action consumes 30 cached tracks without invoking click-time generation', async () => {
+test('recommend action atomically replaces the whole queue with a 30-track radio batch', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([{ id: 1, name: '当前', ar: [{ name: '歌手' }] }, { id: 2, name: '手动', ar: [{ name: '歌手' }] }]);
 	const recommended = Array.from({ length: 30 }, (_, index) => ({
@@ -75,16 +75,17 @@ test('recommend action consumes 30 cached tracks without invoking click-time gen
 	assert.equal(coordinatorCalls, 0);
 	assert.equal(committed, 'tx-1');
 	assert.deepEqual(scheduled, ['low-watermark']);
-	assert.deepEqual(player.state.queue.slice(1, 31).map((item) => item.name), recommended.map((item) => item.title));
-	assert.equal(player.state.queue.at(-1).name, '手动');
+	assert.deepEqual(player.state.queue.map((item) => item.name), recommended.map((item) => item.title));
 	assert.equal(player.current().name, '推荐1');
-	assert.equal(player.state.index, 1);
+	assert.equal(player.state.index, 0);
 	assert.equal(player.state.playing, true);
 	assert.equal(player.state.currentUrl, 'https://audio.test/100.mp3');
-	assert.equal(result.insertMode, 'after-current-and-play');
+	assert.equal(result.mode, 'recommendation-radio');
+	assert.equal(result.batchNumber, 1);
+	assert.equal(player.radioStatus().active, true);
 });
 
-test('consecutive button recommendations keep every earlier song and add 30 more', async () => {
+test('a second recommendation click starts a fresh radio session and replaces the first batch', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([
 		{ id: 1, name: '当前', ar: [{ name: '歌手' }] },
@@ -107,7 +108,7 @@ test('consecutive button recommendations keep every earlier song and add 30 more
 		}),
 		commit: async () => {},
 		restore: async () => {},
-		snapshot: async () => ({ ready: true, count: 60, items: batches.flat() })
+		snapshot: async () => ({ ready: true, count: 60, items: batches.flat(), recentRecommendedTrackKeys: [] })
 	};
 	const actions = plugin.buildActionsForTest(
 		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
@@ -116,14 +117,98 @@ test('consecutive button recommendations keep every earlier song and add 30 more
 		{ pool, scheduler: { schedule: () => true, status: () => ({ state: 'idle' }) } }
 	);
 
-	await actions.recommend({ requestId: 'first' });
-	await actions.recommend({ requestId: 'second' });
+	const first = await actions.recommend({ requestId: 'first' });
+	const second = await actions.recommend({ requestId: 'second' });
 
-	assert.equal(player.state.queue.length, 62);
-	assert.equal(player.state.queue.filter((song) => song.recommendationSessionId === 'button-recommendation').length, 60);
-	assert.equal(player.state.queue.filter((song) => song.name.startsWith('第一批')).length, 30);
+	assert.equal(player.state.queue.length, 30);
+	assert.equal(player.state.queue.filter((song) => song.name.startsWith('第一批')).length, 0);
 	assert.equal(player.current().name, '第二批1');
-	assert.equal(player.state.queue.at(-1).name, '手动');
+	assert.notEqual(first.sessionId, second.sessionId);
+	assert.equal(player.radioStatus().sessionId, second.sessionId);
+});
+
+test('recommendation keeps the old queue when the first recommended track cannot resolve', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '手动歌曲', ar: [{ name: '歌手' }] }]);
+	const batch = Array.from({ length: 30 }, (_, index) => normalizeTrack({
+		id: index + 100,
+		name: `推荐${index + 1}`,
+		artists: `歌手${index + 1}`
+	}, 'pool'));
+	let restored = null;
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true, songUrl: async () => null }, {}, player, {}, { recordPlayback: async () => {} },
+		{
+			pool: {
+				consume: async () => ({ ok: true, tracks: batch, transaction: 'tx-fail', remaining: 30 }),
+				commit: async () => { throw new Error('must not commit'); },
+				restore: async (transaction) => { restored = transaction; },
+				snapshot: async () => ({ recentRecommendedTrackKeys: [] })
+			},
+			scheduler: { schedule: () => true, status: () => ({ state: 'idle' }) }
+		}
+	);
+
+	const result = await actions.recommend({ requestId: 'unplayable' });
+	assert.equal(result.ok, false);
+	assert.equal(restored, 'tx-fail');
+	assert.deepEqual(player.state.queue.map((song) => song.name), ['手动歌曲']);
+	assert.equal(player.radioStatus(), null);
+});
+
+test('next at a radio boundary swaps in a fresh non-repeating batch', async () => {
+	const player = createPlayer({ file: null });
+	const first = Array.from({ length: 30 }, (_, index) => normalizeTrack({ id: index + 1, name: `第一批${index + 1}`, artists: `甲${index + 1}` }, 'pool'));
+	const second = Array.from({ length: 30 }, (_, index) => normalizeTrack({ id: index + 101, name: `第二批${index + 1}`, artists: `乙${index + 1}` }, 'pool'));
+	player.startRecommendationRadio(first, 'radio-boundary');
+	player.jump(29);
+	let exclusions = [];
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true, songUrl: async (id) => `https://audio.test/${id}.mp3` }, {}, player, {}, { recordPlayback: async () => {} },
+		{
+			pool: {
+				consume: async (_count, options) => { exclusions = options.excludeTrackKeys; return { ok: true, tracks: second, transaction: 'tx-next', remaining: 30 }; },
+				commit: async () => {}, restore: async () => {}, snapshot: async () => ({ recentRecommendedTrackKeys: [] })
+			},
+			scheduler: { schedule: () => true, status: () => ({ state: 'idle' }) }
+		}
+	);
+
+	const result = await actions.control({ action: 'next' });
+	assert.equal(result.ok, true);
+	assert.equal(result.mode, 'recommendation-radio');
+	assert.equal(result.batchNumber, 2);
+	assert.equal(player.state.queue.length, 30);
+	assert.equal(player.current().name, '第二批1');
+	assert.equal(player.state.currentUrl, 'https://audio.test/101.mp3');
+	assert.deepEqual(exclusions.sort(), first.map((track) => track.trackKey).sort());
+});
+
+test('next at a radio boundary waits without looping when the next batch is not ready', async () => {
+	const player = createPlayer({ file: null });
+	const first = Array.from({ length: 30 }, (_, index) => normalizeTrack({ id: index + 1, name: `第一批${index + 1}`, artists: `甲${index + 1}` }, 'pool'));
+	player.startRecommendationRadio(first, 'radio-wait');
+	player.jump(29);
+	const scheduled = [];
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} },
+		{
+			pool: { consume: async () => ({ ok: false, remaining: 12 }), snapshot: async () => ({ recentRecommendedTrackKeys: [] }) },
+			scheduler: { schedule: (reason) => scheduled.push(reason), status: () => ({ state: 'idle' }) }
+		}
+	);
+
+	const result = await actions.control({ action: 'next' });
+	assert.equal(result.ok, false);
+	assert.equal(result.preparing, true);
+	assert.equal(player.state.index, 29);
+	assert.equal(player.state.playing, false);
+	assert.equal(player.radioStatus().waitingForNextBatch, true);
+	assert.deepEqual(player.state.queue.map((song) => song.name), first.map((track) => track.title));
+	assert.deepEqual(scheduled, ['radio-boundary']);
 });
 
 test('status exposes recommendation pool readiness without starting generation', async () => {
@@ -142,7 +227,13 @@ test('status exposes recommendation pool readiness without starting generation',
 		}
 	);
 	const status = await actions.status();
-	assert.deepEqual(status.recommendation, { ready: true, count: 60, generating: false, lastError: null });
+	assert.deepEqual(status.recommendation, {
+		ready: true,
+		count: 60,
+		generating: false,
+		lastError: null,
+		radio: { active: false, batchNumber: 0, waitingForNextBatch: false }
+	});
 	assert.equal(generationCalls, 0);
 });
 
@@ -427,7 +518,9 @@ test('tool copy preserves natural dialogue and only recommends on an explicit re
 	assert.match(tools.alger_recommend.description, /明确要求.*立即推荐|直接播放/);
 	assert.match(tools.alger_recommend.description, /自然回应/);
 	assert.match(tools.alger_recommend.description, /不要.*自动搜索/);
-	assert.match(tools.alger_recommend.description, /第一首推荐.*播放/);
+	assert.match(tools.alger_recommend.description, /持续推荐电台/);
+	assert.match(tools.alger_recommend.description, /替换当前播放列表/);
+	assert.match(tools.alger_recommend.description, /每批结束后自动续播/);
 	assert.doesNotMatch(tools.alger_recommend.description, /保留当前歌曲/);
 	assert.doesNotMatch(tools.alger_recommend.description, /随机挑一个整单/);
 	const rendered = JSON.stringify(tools.alger_recommend.output.render({}, { ok: true, tracks: [{ title: '推荐一' }] }));

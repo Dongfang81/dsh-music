@@ -162,6 +162,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 	const pool = recommendation.pool ?? null;
 	const scheduler = recommendation.scheduler ?? null;
 	const now = typeof recommendation.now === 'function' ? recommendation.now : Date.now;
+	let radioSequence = 0;
 	const refreshSignals = new Set(['favorite', 'unfavorite', 'search-play']);
 	const feedback = async (type, song) => {
 		if (cfg.recommendationLearning && coordinator && song) {
@@ -217,8 +218,9 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		const kw = String(keyword || '').trim();
 		const parts = splitKeyword(kw);
 		// 关键词歌手与歌曲歌手是否一致（如「周杰伦 晴天」vs 列表里的 A-LNK 版 → 不一致）
-		const songArtists = ((song && (song.ar || song.artists)) || [])
-			.map((a) => a && a.name)
+		const artistValues = song && (song.ar || song.artists);
+		const songArtists = (Array.isArray(artistValues) ? artistValues : [artistValues])
+			.map((a) => typeof a === 'string' ? a : a && a.name)
 			.filter(Boolean)
 			.join(' ');
 		const consistent = !parts.artist || !songArtists ||
@@ -234,6 +236,32 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			}
 		}
 		return null;
+	}
+
+	async function recommendationUrl(track) {
+		return urlFor(track?.raw ?? track);
+	}
+
+	function compactRadioStatus() {
+		const radio = player.radioStatus?.();
+		return {
+			active: Boolean(radio?.active),
+			batchNumber: Number(radio?.batchNumber) || 0,
+			waitingForNextBatch: Boolean(radio?.waitingForNextBatch)
+		};
+	}
+
+	async function waitForRadioBatch(reason, remaining = 0) {
+		player.setRecommendationRadioWaiting?.(true);
+		player.updatePlayback({ playing: false });
+		scheduler?.schedule(reason, { urgent: true });
+		return {
+			ok: false,
+			preparing: true,
+			mode: 'recommendation-radio',
+			remaining: Number(remaining) || 0,
+			guidance: '正在准备下一批推荐歌曲。'
+		};
 	}
 
 	return {
@@ -270,7 +298,8 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					ready: Boolean(poolState?.ready),
 					count: Number(poolState?.count ?? poolState?.items?.length) || 0,
 					generating: Boolean(schedulerState?.generating || schedulerState?.scheduled),
-					lastError: schedulerState?.lastError ?? null
+					lastError: schedulerState?.lastError ?? null,
+					radio: compactRadioStatus()
 				},
 				queue: snap.queue
 			};
@@ -289,34 +318,47 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		},
 
 		/** 按钮/明确工具请求的快速推荐：只消费后台准备好的推荐池。 */
-		async recommend(_args) {
+		async recommend(args = {}) {
 			if (!(await apiUp())) return { ok: false, guidance: '音乐服务尚未就绪，当前播放和队列保持不变。' };
 			if (!pool) return { ok: false, preparing: true, guidance: '推荐池尚未初始化，请稍后再试。' };
-			const consumed = await pool.consume(30);
+			const [poolState, activeRadio] = await Promise.all([
+				typeof pool.snapshot === 'function' ? pool.snapshot().catch(() => null) : Promise.resolve(null),
+				Promise.resolve(player.radioStatus?.() ?? null)
+			]);
+			const excludeTrackKeys = [
+				...(poolState?.recentRecommendedTrackKeys ?? []),
+				...(activeRadio?.seenTrackKeys ?? [])
+			];
+			const consumed = await pool.consume(30, { excludeTrackKeys });
 			if (!consumed.ok) {
 				scheduler?.schedule('cold-start', { urgent: true });
 				return { ok: false, preparing: true, count: 0, remaining: consumed.remaining, guidance: '推荐正在准备中，请稍后再试。' };
 			}
 			try {
-				player.insertRecommendationAfterCurrent(consumed.tracks, 'button-recommendation', {
-					playFirst: true,
-					replaceUnplayed: false
-				});
-				const hit = await urlFor(player.current());
-				player.updatePlayback({ currentUrl: hit ? hit.url : null, playing: Boolean(hit) });
+				const hit = await recommendationUrl(consumed.tracks[0]);
+				if (!hit) {
+					await pool.restore(consumed.transaction);
+					return { ok: false, count: 0, guidance: '推荐歌曲暂时无法播放，原播放列表已保留。' };
+				}
+				const requestId = String(args?.requestId ?? '').trim() || 'button';
+				const sessionId = `radio-${requestId}-${now()}-${++radioSequence}`;
+				const started = player.startRecommendationRadio(consumed.tracks, sessionId);
+				player.updatePlayback({ currentUrl: hit.url, playing: true });
 				await pool.commit(consumed.transaction);
+				if (consumed.remaining <= 30) scheduler?.schedule('low-watermark', { urgent: true });
+				return {
+					ok: true,
+					mode: 'recommendation-radio',
+					sessionId,
+					batchNumber: started.batchNumber,
+					count: consumed.tracks.length,
+					tracks: consumed.tracks,
+					remaining: consumed.remaining
+				};
 			} catch (error) {
 				await pool.restore(consumed.transaction).catch(() => {});
 				throw error;
 			}
-			if (consumed.remaining <= 30) scheduler?.schedule('low-watermark', { urgent: true });
-			return {
-				ok: true,
-				insertMode: 'after-current-and-play',
-				count: consumed.tracks.length,
-				tracks: consumed.tracks,
-				remaining: consumed.remaining
-			};
 		},
 
 		/** alger_setup：内置音乐服务管理 */
@@ -756,6 +798,36 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					if (player.state.position > 0 && player.state.position < 20) await feedback('skip-short', leaving);
 					else if (player.state.duration > 0 && player.state.position / player.state.duration >= 0.8) await feedback('complete-80', leaving);
 				}
+				if (action === 'next' && player.isRecommendationRadioBoundary?.()) {
+					const radio = player.radioStatus?.();
+					if (!pool || !radio?.active) return waitForRadioBatch('radio-boundary');
+					const consumed = await pool.consume(30, { excludeTrackKeys: radio.seenTrackKeys });
+					if (!consumed.ok) return waitForRadioBatch('radio-boundary', consumed.remaining);
+					try {
+						const hit = await recommendationUrl(consumed.tracks[0]);
+						if (!hit) {
+							await pool.restore(consumed.transaction);
+							return waitForRadioBatch('radio-boundary', consumed.remaining);
+						}
+						const swapped = player.replaceRecommendationRadioBatch(consumed.tracks);
+						player.updatePlayback({ currentUrl: hit.url, playing: true });
+						await pool.commit(consumed.transaction);
+						if (consumed.remaining <= 30) scheduler?.schedule('low-watermark', { urgent: true });
+						return {
+							ok: true,
+							action,
+							mode: 'recommendation-radio',
+							sessionId: swapped.sessionId,
+							batchNumber: swapped.batchNumber,
+							count: swapped.count,
+							song: swapped.song?.name ?? null,
+							playing: true
+						};
+					} catch (error) {
+						await pool.restore(consumed.transaction).catch(() => {});
+						throw error;
+					}
+				}
 				const song = action === 'next' ? player.next() : player.prev();
 				if (!song) throw new Error('队列为空，无法切换。');
 				const hit = await urlFor(song);
@@ -1126,14 +1198,14 @@ function buildTools(cfg, actions) {
 	const recommend = {
 		name: 'alger_recommend',
 		description:
-			'仅在用户明确要求立即推荐、直接播放或“来一批歌”时调用。按钮式快速推荐会把完整一批歌曲加入播放列表，并从第一首推荐开始播放；如果用户只是在表达情绪、犹豫或闲聊，应先自然回应、提供情绪价值和想法，不要为了结构化而自动搜索或急着给结果。',
+			'仅在用户明确要求立即推荐、直接播放或“来一批歌”时调用。开启持续推荐电台会替换当前播放列表，从第一批 30 首的第一首开始播放，并在每批结束后自动续播新的 30 首；如果用户只是在表达情绪、犹豫或闲聊，应先自然回应、提供情绪价值和想法，不要为了结构化而自动搜索或急着给结果。',
 		parameters: compileParameters({}),
 		output: {
 			schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
 			render: (_args, value) => {
 				const rec = asRecord(value);
 				const lines = [];
-				if (rec.ok) lines.push('♫ 已加入 ' + ((rec.tracks || []).length || 0) + ' 首推荐，并开始播放本批第一首。');
+				if (rec.ok) lines.push('♫ 已开启持续推荐电台，从本批 ' + ((rec.tracks || []).length || 0) + ' 首的第一首开始播放。');
 				if (rec.guidance) lines.push('提示: ' + rec.guidance);
 				return textBlock(lines);
 			}
