@@ -146,6 +146,46 @@ test('status exposes recommendation pool readiness without starting generation',
 	assert.equal(generationCalls, 0);
 });
 
+test('status health cache shares probes and uses adaptive success and failure TTLs', async () => {
+	let current = 1;
+	let calls = 0;
+	let releaseFirst;
+	const laterResults = [false, true];
+	const client = {
+		musicApiUp: async () => {
+			calls += 1;
+			if (calls === 1) return new Promise((resolve) => { releaseFirst = resolve; });
+			return laterResults.shift();
+		}
+	};
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		client, {}, createPlayer({ file: null }), {}, { recordPlayback: async () => {} },
+		{ now: () => current }
+	);
+	const first = actions.status();
+	const second = actions.status();
+	await Promise.resolve();
+	assert.equal(calls, 1, 'concurrent status reads share one health probe');
+	releaseFirst(true);
+	assert.equal((await first).musicApiUp, true);
+	assert.equal((await second).musicApiUp, true);
+
+	current = 60_000;
+	assert.equal((await actions.status()).musicApiUp, true);
+	assert.equal(calls, 1, 'a successful probe is cached for 60 seconds');
+
+	current = 60_002;
+	assert.equal((await actions.status()).musicApiUp, false);
+	assert.equal(calls, 2);
+	current = 65_001;
+	assert.equal((await actions.status()).musicApiUp, false);
+	assert.equal(calls, 2, 'a failed probe is cached for 5 seconds');
+	current = 65_003;
+	assert.equal((await actions.status()).musicApiUp, true);
+	assert.equal(calls, 3);
+});
+
 test('strong preference signals schedule refresh while skip and completion only update history', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([

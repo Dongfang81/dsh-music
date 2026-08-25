@@ -51,3 +51,18 @@ test('parent abort remains active while the response body is being read', async 
 	controller.abort(new Error('body cancelled'));
 	await assert.rejects(() => pending, /body cancelled/);
 });
+
+test('music API health probes the local root without issuing a search', async () => {
+	const urls = [];
+	const client = createClient(
+		{ musicApiHost: '127.0.0.1', musicApiPort: 30588, timeoutMs: 10000 },
+		{
+			fetch: async (url) => {
+				urls.push(String(url));
+				return { ok: false, status: 404, text: async () => '' };
+			}
+		}
+	);
+	assert.equal(await client.musicApiUp(), true);
+	assert.deepEqual(urls, ['http://127.0.0.1:30588/']);
+});

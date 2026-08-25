@@ -161,6 +161,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 	const preference = recommendation.preference ?? null;
 	const pool = recommendation.pool ?? null;
 	const scheduler = recommendation.scheduler ?? null;
+	const now = typeof recommendation.now === 'function' ? recommendation.now : Date.now;
 	const refreshSignals = new Set(['favorite', 'unfavorite', 'search-play']);
 	const feedback = async (type, song) => {
 		if (cfg.recommendationLearning && coordinator && song) {
@@ -177,14 +178,21 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 	};
 	shared.getNotice = () => (noticeStore.until > Date.now() ? noticeStore.text : null);
 
-	// 音乐服务是否在线（2s 探活缓存）
-	let apiUpCache = { value: false, at: 0 };
+	// 音乐服务是否在线：成功长缓存、失败短缓存；并发状态读取共享一次探活。
+	let apiUpCache = { value: false, at: 0, valid: false };
+	let apiUpPending = null;
 	async function apiUp() {
-		if (Date.now() - apiUpCache.at < 2000) return apiUpCache.value;
-		const up = await client.musicApiUp();
-		apiUpCache = { value: up, at: Date.now() };
-		if (apiHandle) apiHandle.isUp = up;
-		return up;
+		const ttl = apiUpCache.value ? 60_000 : 5_000;
+		if (apiUpCache.valid && now() - apiUpCache.at < ttl) return apiUpCache.value;
+		if (apiUpPending) return apiUpPending;
+		apiUpPending = Promise.resolve(client.musicApiUp({ timeoutMs: 1000 }))
+			.then((up) => {
+				apiUpCache = { value: Boolean(up), at: now(), valid: true };
+				if (apiHandle) apiHandle.isUp = Boolean(up);
+				return Boolean(up);
+			})
+			.finally(() => { apiUpPending = null; });
+		return apiUpPending;
 	}
 
 	/** 原始关键词 → 拆成「歌名 - 歌手」（支持「歌手 歌名」/「歌名 歌手」/「歌名-歌手」）。 */
