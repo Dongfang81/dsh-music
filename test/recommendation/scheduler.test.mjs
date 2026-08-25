@@ -5,6 +5,30 @@ import { createRecommendationScheduler } from '../../lib/recommendation/schedule
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
 
+test('whenIdle keeps an explicitly awaited unrefed debounce alive', async () => {
+	let callback;
+	let refCalls = 0;
+	let unrefCalls = 0;
+	const timerHandle = {
+		ref() { refCalls += 1; },
+		unref() { unrefCalls += 1; }
+	};
+	const scheduler = createRecommendationScheduler({
+		debounceMs: 10,
+		setTimeoutFn(fn) { callback = fn; return timerHandle; },
+		clearTimeoutFn() {},
+		generate: async () => {}
+	});
+
+	scheduler.schedule('favorite');
+	assert.equal(unrefCalls, 1, 'background debounce does not keep DSH alive');
+	const idle = scheduler.whenIdle();
+	assert.equal(refCalls, 1, 'an explicit waiter keeps the pending debounce alive');
+	callback();
+	await idle;
+	assert.equal(scheduler.status().state, 'idle');
+});
+
 test('coalesces consecutive triggers into one background generation', async () => {
 	const calls = [];
 	const scheduler = createRecommendationScheduler({
