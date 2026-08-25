@@ -5,6 +5,7 @@ import {
 	classifyVersion,
 	dedupeTracks,
 	isRequestedVersion,
+	isPlaceholderArtist,
 	normalizeTrack,
 	trackKey
 } from '../../lib/recommendation/identity.js';
@@ -54,4 +55,14 @@ test('classifies common non-original versions', () => {
 test('rejects malformed empty tracks instead of creating a shared empty identity', () => {
 	assert.equal(normalizeTrack(null, 'bad'), null);
 	assert.equal(normalizeTrack({ name: ' ', artists: '' }, 'bad'), null);
+});
+
+test('rejects coerced object placeholder artists without banning a real Object artist', () => {
+	assert.equal(isPlaceholderArtist('[Object Object]'), true);
+	assert.equal(isPlaceholderArtist('Object Object'), true);
+	assert.equal(isPlaceholderArtist('Object'), false);
+	assert.equal(normalizeTrack({ name: '坏数据', artists: ['[Object Object]'] }, 'bad'), null);
+	assert.equal(normalizeTrack({ name: '坏数据', artists: [{}] }, 'bad'), null);
+	assert.equal(normalizeTrack({ name: '坏数据', artists: [{ name: { nested: true } }] }, 'bad'), null);
+	assert.equal(normalizeTrack({ name: '合法歌曲', artists: ['Object'] }, 'good').artists[0], 'Object');
 });
