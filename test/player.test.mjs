@@ -185,3 +185,55 @@ test('queue removal validates indices and only the latest removal can be undone'
 	assert.throws(() => player.undoQueueRemoval(first.token), /已失效/);
 	assert.equal(player.undoQueueRemoval(second.token).restored.id, 2);
 });
+
+test('player revisions change only for material state and collection mutations', () => {
+	const player = createPlayer({ file: null });
+	const initial = player.revisions();
+	assert.deepEqual(initial, { stateRevision: 1, queueRevision: 1, favoritesRevision: 1 });
+	player.reportPlayback({ position: 0, duration: 0, ready: false });
+	player.append([]);
+	assert.deepEqual(player.revisions(), initial, 'unchanged reports and empty appends do not invalidate state');
+
+	player.append([song(1, '一')]);
+	assert.deepEqual(player.revisions(), { stateRevision: 2, queueRevision: 2, favoritesRevision: 1 });
+	player.jump(0);
+	const beforeFavorite = player.revisions();
+	player.toggleFavorite();
+	assert.deepEqual(player.revisions(), {
+		stateRevision: beforeFavorite.stateRevision + 1,
+		queueRevision: beforeFavorite.queueRevision,
+		favoritesRevision: beforeFavorite.favoritesRevision + 1
+	});
+});
+
+test('compact snapshots omit collection rows while queueView provides revisioned rows', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '一'), song(2, '二')]);
+	player.toggleFavorite();
+
+	const legacy = player.snapshot();
+	assert.equal(legacy.queue.items.length, 2);
+	assert.deepEqual(legacy.favoriteIds, [1]);
+
+	const compact = player.snapshot({ includeQueue: false, includeFavoriteIds: false });
+	assert.deepEqual(compact.queue, {
+		count: 2,
+		index: 0,
+		revision: player.revisions().queueRevision
+	});
+	assert.deepEqual(compact.favorites, {
+		count: 1,
+		revision: player.revisions().favoritesRevision
+	});
+	assert.equal('favoriteIds' in compact, false);
+	assert.equal(compact.stateRevision, player.revisions().stateRevision);
+	assert.deepEqual(player.queueView(), {
+		revision: player.revisions().queueRevision,
+		count: 2,
+		index: 0,
+		items: [
+			{ id: 1, name: '一', artists: '歌手1' },
+			{ id: 2, name: '二', artists: '歌手2' }
+		]
+	});
+});

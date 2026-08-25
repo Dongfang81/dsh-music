@@ -238,16 +238,18 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 
 	return {
 		/** alger_status */
-		async status() {
+		async status(options = {}) {
+			const compact = Boolean(options.compact);
 			const [musicApiUp, poolState] = await Promise.all([
 				apiUp(),
 				pool ? pool.status().catch(() => null) : Promise.resolve(null)
 			]);
 			const schedulerState = scheduler?.status?.() ?? null;
-			const snap = player.snapshot();
+			const snap = player.snapshot({ includeQueue: !compact, includeFavoriteIds: !compact });
 			return {
 				ok: true,
 				musicApiUp,
+				stateRevision: snap.stateRevision,
 				playing: snap.playing
 					? { ok: true, isPlaying: snap.isPlaying, song: snap.playing }
 					: null,
@@ -255,8 +257,9 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					? { position: snap.position, duration: snap.duration, playing: snap.isPlaying }
 					: null,
 				favorite: snap.favorite,
-				favoriteIds: snap.favoriteIds,
+				...(compact ? {} : { favoriteIds: snap.favoriteIds }),
 				favoriteCount: snap.favoriteCount,
+				favorites: snap.favorites,
 				playMode: snap.playMode,
 				volume: snap.volume,
 				currentUrl: snap.currentUrl,
@@ -271,6 +274,10 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				},
 				queue: snap.queue
 			};
+		},
+
+		async queueView() {
+			return { ok: true, ...player.queueView() };
 		},
 
 		/** alger_say：让宠物开口说一句话（气泡提示约 6 秒） */
@@ -296,8 +303,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 					replaceUnplayed: false
 				});
 				const hit = await urlFor(player.current());
-				player.state.currentUrl = hit ? hit.url : null;
-				if (!hit) player.state.playing = false;
+				player.updatePlayback({ currentUrl: hit ? hit.url : null, playing: Boolean(hit) });
 				await pool.commit(consumed.transaction);
 			} catch (error) {
 				await pool.restore(consumed.transaction).catch(() => {});
@@ -576,7 +582,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 
 			// 3) 写入播放状态（客户端轮询到 currentUrl 后自动播放）
 			player.playSong(song);
-			player.state.currentUrl = url;
+			player.updatePlayback({ currentUrl: url });
 			await feedback('search-play', song);
 			shared.setNotice('♪ 已播放：' + song.name);
 			return { ok: true, steps, playedName: song.name, playedId: song.id, confirmed: true };
@@ -594,8 +600,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				const result = player.removeQueueAt(args?.index);
 				if (result.currentChanged && result.current) {
 					const hit = await urlFor(result.current);
-					player.state.currentUrl = hit ? hit.url : null;
-					if (!hit) player.state.playing = false;
+					player.updatePlayback({ currentUrl: hit ? hit.url : null, ...(hit ? {} : { playing: false }) });
 				}
 				return {
 					ok: true,
@@ -636,8 +641,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				}
 				log(`收藏列表 ${fv.count} 首，从「${fv.song.name}」开始播放`);
 				const hit = await urlFor(fv.song);
-				player.state.currentUrl = hit ? hit.url : null;
-				player.state.playing = true;
+				player.updatePlayback({ currentUrl: hit ? hit.url : null, playing: true });
 				return { ok: true, steps, mode: 'favorites', added: fv.count, queueLength: player.state.queue.length, playedName: fv.song.name };
 			}
 
@@ -695,8 +699,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				const song = player.jump(idx);
 				const hit = await urlFor(song);
 				if (!hit) return { ok: false, steps: [...steps, `「${song.name}」暂无可用播放地址`], guidance: '换一首试试。' };
-				player.state.currentUrl = hit.url;
-				player.state.playing = true;
+				player.updatePlayback({ currentUrl: hit.url, playing: true });
 				return { ok: true, steps, mode: 'jump', playedName: song ? song.name : '', queueLength: player.state.queue.length };
 			} else {
 				// add-all：整批搜索结果加入
@@ -713,8 +716,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			if (mode === 'replace') {
 				const song = player.replaceAndPlay(songs);
 				const hit = await urlFor(song);
-				player.state.currentUrl = hit ? hit.url : null;
-				player.state.playing = true;
+				player.updatePlayback({ currentUrl: hit ? hit.url : null, playing: true });
 				shared.setNotice('♫ 整单播放：' + (song ? song.name : '') + '（' + songs.length + ' 首）');
 				return { ok: true, steps, mode, added: songs.length, queueLength: player.state.queue.length, playedName: song ? song.name : null };
 			}
@@ -740,7 +742,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				if (player.state.playing === wantPlay) {
 					return { action, message: `当前已是${wantPlay ? '播放' : '暂停'}状态，无需操作` };
 				}
-				player.state.playing = wantPlay;
+				player.updatePlayback({ playing: wantPlay });
 				return { action, message: wantPlay ? '已播放' : '已暂停', playing: player.state.playing };
 			}
 			if (action === 'next' || action === 'prev') {
@@ -753,8 +755,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				if (!song) throw new Error('队列为空，无法切换。');
 				const hit = await urlFor(song);
 				if (!hit) throw new Error(`「${song.name}」暂无可用播放地址。`);
-				player.state.currentUrl = hit.url;
-				player.state.playing = true;
+				player.updatePlayback({ currentUrl: hit.url, playing: true });
 				return { action, message: '已切到：' + song.name, song: song.name, playing: true };
 			}
 			if (action === 'volume-up' || action === 'volume-down') {
@@ -1256,7 +1257,18 @@ function registerRoutes(webServer, actions) {
 			path: '/dsh-alger/state',
 			handler: async (_req, res) => {
 				try {
-					json(res, await actions.status());
+					json(res, await actions.status({ compact: true }));
+				} catch (error) {
+					json(res, { ok: false, error: String((error && error.message) || error) });
+				}
+			}
+		},
+		{
+			kind: 'exact',
+			path: '/dsh-alger/queue-view',
+			handler: async (_req, res) => {
+				try {
+					json(res, await actions.queueView());
 				} catch (error) {
 					json(res, { ok: false, error: String((error && error.message) || error) });
 				}

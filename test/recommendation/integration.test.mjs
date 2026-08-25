@@ -186,6 +186,54 @@ test('status health cache shares probes and uses adaptive success and failure TT
 	assert.equal(calls, 3);
 });
 
+test('browser status is compact while model status retains collection details', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	player.toggleFavorite();
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} }
+	);
+	const compact = await actions.status({ compact: true });
+	assert.deepEqual(compact.queue, { count: 1, index: 0, revision: player.revisions().queueRevision });
+	assert.deepEqual(compact.favorites, { count: 1, revision: player.revisions().favoritesRevision });
+	assert.equal('favoriteIds' in compact, false);
+	const full = await actions.status();
+	assert.equal(full.queue.items.length, 1);
+	assert.deepEqual(full.favoriteIds, [1]);
+});
+
+test('state route requests compact status and queue-view exposes revisioned rows', async () => {
+	const routes = [];
+	const statusOptions = [];
+	registerRoutesForTest({ register: (route) => routes.push(route) }, {
+		status: async (options) => { statusOptions.push(options); return { ok: true, queue: { count: 2 } }; },
+		queueView: async () => ({ ok: true, revision: 4, count: 2, index: 0, items: [{ id: 1 }] })
+	});
+	const stateRes = response();
+	await routes.find((item) => item.path === '/dsh-alger/state').handler(request({}), stateRes);
+	assert.deepEqual(statusOptions, [{ compact: true }]);
+	assert.deepEqual(stateRes.body, { ok: true, queue: { count: 2 } });
+	const queueRes = response();
+	const queueRoute = routes.find((item) => item.path === '/dsh-alger/queue-view');
+	assert.ok(queueRoute);
+	await queueRoute.handler(request({}), queueRes);
+	assert.deepEqual(queueRes.body, { ok: true, revision: 4, count: 2, index: 0, items: [{ id: 1 }] });
+});
+
+test('action-level playback mutations invalidate compact player state', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} }
+	);
+	const before = player.revisions().stateRevision;
+	await actions.control({ action: 'pause' });
+	assert.equal(player.state.playing, false);
+	assert.equal(player.revisions().stateRevision, before + 1);
+});
+
 test('strong preference signals schedule refresh while skip and completion only update history', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([
