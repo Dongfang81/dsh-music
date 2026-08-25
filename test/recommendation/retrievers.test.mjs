@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { normalizeTrack } from '../../lib/recommendation/identity.js';
-import { collectCandidates, createRetrievers } from '../../lib/recommendation/retrievers.js';
+import { collectCandidates, createRetrievers, retrieveCurrentSimilar } from '../../lib/recommendation/retrievers.js';
 
 const context = { activity: 'listen', currentTrack: null, recentTrackKeys: [], queueTrackKeys: [] };
 const profile = { version: 2, tracks: {}, artists: {}, rules: [], resolverStats: {} };
@@ -79,4 +79,20 @@ test('factory adapters pass parent cancellation to the underlying music request'
 	controller.abort(new Error('user cancelled'));
 	await assert.rejects(() => pending, /user cancelled/);
 	assert.equal(requestSignal?.aborted, true);
+});
+
+test('does not use a placeholder artist as the seed for current-song similarity', async () => {
+	let calls = 0;
+	const client = {
+		apiBase: 'https://music.example',
+		getJson: async () => { calls += 1; return { songs: [trackA] }; },
+		search: async () => { calls += 1; return { songs: [trackA] }; }
+	};
+	const tracks = await retrieveCurrentSimilar({
+		context: { currentTrack: { ...trackA, artists: ['[Object Object]'], raw: { id: 42 } } },
+		client,
+		signal: new AbortController().signal
+	});
+	assert.deepEqual(tracks, []);
+	assert.equal(calls, 0);
 });
