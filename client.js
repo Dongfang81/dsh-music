@@ -107,6 +107,25 @@ window.__ModuleLoader__.load({
 			return Boolean(open) && remoteRevision !== undefined && remoteRevision !== null && cachedRevision !== remoteRevision;
 		}
 
+		function virtualWindow(total, scrollTop, rowHeight, viewportHeight, overscan, threshold) {
+			var count = Math.max(0, Number(total) || 0);
+			var limit = threshold === undefined ? 50 : Math.max(0, Number(threshold) || 0);
+			if (count <= limit) return { virtualized: false, start: 0, end: count, padTop: 0, padBottom: 0 };
+			var height = Math.max(1, Number(rowHeight) || 1);
+			var viewport = Math.max(0, Number(viewportHeight) || 0);
+			var extra = Math.max(0, Number(overscan) || 0);
+			var offset = Math.max(0, Number(scrollTop) || 0);
+			var start = Math.max(0, Math.floor(offset / height) - extra);
+			var end = Math.min(count, Math.ceil((offset + viewport) / height) + extra);
+			return {
+				virtualized: true,
+				start: start,
+				end: end,
+				padTop: start * height,
+				padBottom: (count - end) * height
+			};
+		}
+
 		function createPlaybackReporter(options) {
 			var read = options.read;
 			var send = options.send;
@@ -436,20 +455,42 @@ window.__ModuleLoader__.load({
 			}, "♥");
 		}
 
+		function VirtualizedRows(props) {
+			var items = Array.isArray(props && props.items) ? props.items : [];
+			var [scrollTop, setScrollTop] = React.useState(0);
+			var windowed = virtualWindow(items.length, scrollTop, props.rowHeight, props.viewportHeight, props.overscan, props.threshold);
+			var rows = items.slice(windowed.start, windowed.end).map(function (item, offset) {
+				return props.renderRow(item, windowed.start + offset);
+			});
+			if (items.length === 0) {
+				return h("div", { key: props.listKey, className: props.className }, props.empty);
+			}
+			if (!windowed.virtualized) return h("div", { key: props.listKey, className: props.className }, rows);
+			return h("div", {
+				key: props.listKey,
+				className: props.className,
+				onScroll: function (event) { setScrollTop(event.currentTarget.scrollTop || 0); }
+			}, h("div", {
+				className: "dsa-virtual-space",
+				style: { height: items.length * props.rowHeight }
+			}, h("div", {
+				className: "dsa-virtual-window",
+				style: { transform: "translateY(" + windowed.padTop + "px)" }
+			}, rows)));
+		}
+
 		function FavoriteListPanel(props) {
 			var songs = Array.isArray(props && props.songs) ? props.songs : [];
-			return h("div", { className: "dsa-favorites", role: "region", "aria-label": "我的收藏" }, [
-				h("div", { key: "head", className: "dsa-favorites-head" }, [
-					h("strong", null, "我的收藏"),
-					h("span", { className: "dsa-favorites-count" }, songs.length + " 首"),
-					h("button", {
-						type: "button", className: "dsa-favorites-play", "aria-label": "播放全部收藏", title: "播放全部",
-						disabled: songs.length === 0 || Boolean(props && props.busy),
-						onClick: props && props.onPlayAll
-					}, "▶"),
-					h("button", { type: "button", className: "dsa-favorites-close", "aria-label": "关闭收藏列表", title: "关闭", onClick: props && props.onClose }, "×")
-				]),
-				h("div", { key: "songs", className: "dsa-favorites-songs" }, songs.length ? songs.map(function (song, index) {
+			var songRows = VirtualizedRows({
+				items: songs,
+				listKey: "songs",
+				className: "dsa-favorites-songs",
+				rowHeight: 29,
+				viewportHeight: 205,
+				overscan: 5,
+				threshold: 50,
+				empty: h("div", { className: "dsa-favorites-empty" }, props && props.loading ? "正在读取收藏…" : "还没有收藏音乐，播放歌曲时点红心即可收藏。"),
+				renderRow: function (song, index) {
 					var play = function () {
 						if (!Boolean(props && props.busy) && typeof props.onPlayFrom === "function") props.onPlayFrom(index);
 					};
@@ -470,7 +511,20 @@ window.__ModuleLoader__.load({
 							onDoubleClick: function (event) { event.stopPropagation(); }
 						}, "×")
 					]);
-				}) : h("div", { className: "dsa-favorites-empty" }, props && props.loading ? "正在读取收藏…" : "还没有收藏音乐，播放歌曲时点红心即可收藏。"))
+				}
+			});
+			return h("div", { className: "dsa-favorites", role: "region", "aria-label": "我的收藏" }, [
+				h("div", { key: "head", className: "dsa-favorites-head" }, [
+					h("strong", null, "我的收藏"),
+					h("span", { className: "dsa-favorites-count" }, songs.length + " 首"),
+					h("button", {
+						type: "button", className: "dsa-favorites-play", "aria-label": "播放全部收藏", title: "播放全部",
+						disabled: songs.length === 0 || Boolean(props && props.busy),
+						onClick: props && props.onPlayAll
+					}, "▶"),
+					h("button", { type: "button", className: "dsa-favorites-close", "aria-label": "关闭收藏列表", title: "关闭", onClick: props && props.onClose }, "×")
+				]),
+				songRows
 			]);
 		}
 
@@ -491,6 +545,38 @@ window.__ModuleLoader__.load({
 					onClick: function (event) { event.stopPropagation(); if (typeof props.onRemove === "function") props.onRemove(index); },
 					onDoubleClick: function (event) { event.stopPropagation(); }
 				}, "×")
+			]);
+		}
+
+		function QueueListPanel(props) {
+			var items = Array.isArray(props && props.items) ? props.items : [];
+			return h("div", null, [
+				VirtualizedRows({
+					items: items,
+					className: "dsa-queue-list",
+					rowHeight: 28,
+					viewportHeight: 130,
+					overscan: 5,
+					threshold: 50,
+					empty: h("div", { className: "dsa-empty" }, props && props.loading ? "正在加载播放列表…" : "播放列表为空"),
+					renderRow: function (item, index) {
+						return QueueSongRow({
+							key: item.id + "-" + index, item: item, index: index,
+							current: index === props.currentIndex,
+							selected: index === props.selectedIndex,
+							onSelect: props.onSelect,
+							onJump: props.onJump,
+							onRemove: props.onRemove
+						});
+					}
+				}),
+				h("div", { className: "dsa-qclear-row" }, [
+					h("button", {
+						className: "dsa-qclear",
+						disabled: Boolean(props && props.busy) || items.length === 0,
+						onClick: props && props.onClear
+					}, "清空播放列表")
+				])
 			]);
 		}
 
@@ -1019,7 +1105,8 @@ window.__ModuleLoader__.load({
 			".dsa-favorites{margin-top:7px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.05);overflow:hidden}",
 			".dsa-favorites-head{height:32px;display:flex;align-items:center;gap:6px;padding:0 7px;border-bottom:1px solid rgba(255,255,255,.08)}.dsa-favorites-head strong{font-size:11px}.dsa-favorites-count{font-size:9.5px;color:rgba(255,255,255,.5)}",
 			".dsa-favorites-play,.dsa-favorites-close{width:22px;height:22px;border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.8);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}.dsa-favorites-play{font-size:9px}.dsa-favorites-play:hover,.dsa-favorites-close:hover{background:rgba(255,255,255,.13);color:#fff}.dsa-favorites-play:disabled{opacity:.3;cursor:not-allowed}.dsa-favorites-close{margin-left:auto;font-size:14px}",
-			".dsa-favorites-songs{max-height:205px;overflow-y:auto;padding:3px;scrollbar-width:thin}.dsa-favorite-row{width:100%;height:29px;border:0;border-radius:7px;background:transparent;color:#fff;display:flex;align-items:center;gap:6px;padding:0 6px;text-align:left;cursor:pointer}.dsa-favorite-row:hover{background:rgba(255,255,255,.1)}.dsa-favorite-row[aria-disabled=true]{cursor:default;opacity:.65}.dsa-favorite-row .n{width:20px;flex:none;font-size:9.5px;color:rgba(255,255,255,.38);text-align:right}.dsa-favorite-row .t{flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-row .s{max-width:88px;font-size:9.5px;color:rgba(255,255,255,.52);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-remove{flex:none;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.55);font-size:15px;line-height:16px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .14s,background .14s}.dsa-favorite-row:hover .dsa-favorite-remove,.dsa-favorite-remove:focus-visible{opacity:1;pointer-events:auto}.dsa-favorite-remove:hover{background:rgba(239,68,68,.2);color:#fca5a5}.dsa-favorites-empty{padding:18px 10px;text-align:center;font-size:10px;line-height:1.5;color:rgba(255,255,255,.45)}",
+			".dsa-favorites-songs{max-height:205px;overflow-y:auto;padding:3px;scrollbar-width:thin}.dsa-favorite-row{box-sizing:border-box;width:100%;height:29px;border:0;border-radius:7px;background:transparent;color:#fff;display:flex;align-items:center;gap:6px;padding:0 6px;text-align:left;cursor:pointer}.dsa-favorite-row:hover{background:rgba(255,255,255,.1)}.dsa-favorite-row[aria-disabled=true]{cursor:default;opacity:.65}.dsa-favorite-row .n{width:20px;flex:none;font-size:9.5px;color:rgba(255,255,255,.38);text-align:right}.dsa-favorite-row .t{flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-row .s{max-width:88px;font-size:9.5px;color:rgba(255,255,255,.52);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-remove{flex:none;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.55);font-size:15px;line-height:16px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .14s,background .14s}.dsa-favorite-row:hover .dsa-favorite-remove,.dsa-favorite-remove:focus-visible{opacity:1;pointer-events:auto}.dsa-favorite-remove:hover{background:rgba(239,68,68,.2);color:#fca5a5}.dsa-favorites-empty{padding:18px 10px;text-align:center;font-size:10px;line-height:1.5;color:rgba(255,255,255,.45)}",
+			".dsa-virtual-space{position:relative;width:100%}.dsa-virtual-window{position:absolute;left:0;right:0;top:0}",
 			".dsa-notice{margin-top:7px;padding:5px 9px;border-radius:8px;font-size:11px;line-height:1.45;background:rgba(245,158,11,0.16);border:1px solid rgba(245,158,11,0.35);color:#fcd34d}",
 			".dsa-notice.ok{background:rgba(52,211,153,0.14);border-color:rgba(52,211,153,0.35);color:#6ee7b7}",
 			".dsa-notice.err{background:rgba(239,68,68,0.14);border-color:rgba(239,68,68,0.35);color:#fca5a5}",
@@ -1063,8 +1150,8 @@ window.__ModuleLoader__.load({
 			".dsa-qclear{border:none;background:transparent;color:rgba(255,255,255,0.35);font-size:9.5px;padding:2px 8px;cursor:pointer;border-radius:6px}",
 			".dsa-qclear:hover{color:rgba(255,255,255,0.6);background:rgba(255,255,255,0.06)}",
 			".dsa-qclear:disabled{opacity:0.3;cursor:not-allowed}",
-			".dsa-queue-list{max-height:130px;overflow-y:auto;padding:0 6px 6px}",
-			".dsa-qitem{display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:7px;font-size:11px;color:rgba(255,255,255,0.8);cursor:pointer}",
+			".dsa-queue-list{max-height:130px;overflow-y:auto;padding:0 6px;scrollbar-width:thin}",
+			".dsa-qitem{box-sizing:border-box;height:28px;display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:7px;font-size:11px;color:rgba(255,255,255,0.8);cursor:pointer}",
 			".dsa-qitem:hover{background:rgba(255,255,255,0.08)}",
 			".dsa-qitem.cur{background:rgba(59,130,246,0.22);color:#fff}",
 			".dsa-qitem.sel{box-shadow:inset 0 0 0 1px rgba(255,255,255,0.5);background:rgba(255,255,255,0.12);color:#fff}",
@@ -2385,25 +2472,17 @@ window.__ModuleLoader__.load({
 										h("span", { className: "fold" }, queueOpen ? "▾" : "▸")
 									]),
 									queueOpen
-									? h("div", { className: "dsa-queue-list" }, [
-											queueView && Array.isArray(queueView.items) ? queueView.items.map(function (item, i) {
-												return h(QueueSongRow, {
-													key: item.id + "-" + i, item: item, index: i,
-													current: i === state.queue.index,
-													selected: i === selectedIdx,
-													onSelect: onQueueSelect,
-													onJump: onQueueJump,
-													onRemove: onQueueRemove
-												});
-											}) : h("div", { className: "dsa-empty" }, "正在加载播放列表…"),
-											h("div", { className: "dsa-qclear-row" }, [
-												h("button", {
-													className: "dsa-qclear",
-													disabled: busy || (state.queue.count || 0) === 0,
-														onClick: onQueueClear
-													}, "清空播放列表")
-												])
-											])
+									? h(QueueListPanel, {
+										items: queueView && Array.isArray(queueView.items) ? queueView.items : [],
+										loading: !(queueView && Array.isArray(queueView.items)),
+										currentIndex: state.queue.index,
+										selectedIndex: selectedIdx,
+										busy: busy,
+										onSelect: onQueueSelect,
+										onJump: onQueueJump,
+										onRemove: onQueueRemove,
+										onClear: onQueueClear
+									})
 										: null
 								])
 							: null,
@@ -2470,6 +2549,7 @@ window.__ModuleLoader__.load({
 		exports.fetchJsonWithTimeout = fetchJsonWithTimeout;
 		exports.compactStateSignature = compactStateSignature;
 		exports.shouldReloadCollection = shouldReloadCollection;
+		exports.virtualWindow = virtualWindow;
 		exports.createPlaybackReporter = createPlaybackReporter;
 		exports.createAnalyzerLifecycle = createAnalyzerLifecycle;
 		exports.parseLrc = parseLrc;
@@ -2493,6 +2573,7 @@ window.__ModuleLoader__.load({
 		exports.FavoriteHeartButton = FavoriteHeartButton;
 		exports.FavoriteListPanel = FavoriteListPanel;
 		exports.QueueSongRow = QueueSongRow;
+		exports.QueueListPanel = QueueListPanel;
 		exports.queuePayloadForSearchItem = queuePayloadForSearchItem;
 		exports.searchFeedbackForResponse = searchFeedbackForResponse;
 		return module.exports;

@@ -144,6 +144,16 @@ test('compact state signatures ignore object identity and collection reloads req
 	assert.equal(shouldReloadCollection(4, 5, true), true);
 });
 
+test('virtual window renders every short row but bounds long collection work', () => {
+	const { virtualWindow } = loadClient();
+	assert.deepEqual({ ...virtualWindow(20, 500, 29, 205, 5, 50) }, {
+		virtualized: false, start: 0, end: 20, padTop: 0, padBottom: 0
+	});
+	assert.deepEqual({ ...virtualWindow(120, 580, 29, 205, 5, 50) }, {
+		virtualized: true, start: 15, end: 33, padTop: 435, padBottom: 2523
+	});
+});
+
 test('playback reporter sends on transitions and checkpoints only while active', async () => {
 	const { createPlaybackReporter } = loadClient();
 	let active = false;
@@ -314,6 +324,19 @@ test('favorite list keeps the compact play icon directly after the song count', 
 	assert.deepEqual(events, ['all', 'from:1']);
 });
 
+test('favorite list initially mounts only a bounded window for long collections', () => {
+	const { FavoriteListPanel } = loadClient();
+	const songs = Array.from({ length: 120 }, (_, index) => ({
+		id: index + 1, name: `歌曲${index + 1}`, artists: '歌手'
+	}));
+	const tree = FavoriteListPanel({ songs });
+	const rows = findNodes(tree, (node) => node.props?.className === 'dsa-favorite-row');
+	const spacer = findNodes(tree, (node) => node.props?.className === 'dsa-virtual-space')[0];
+	assert.equal(rows.length, 13, 'viewport plus overscan is mounted instead of all 120 rows');
+	assert.equal(spacer.props.style.height, 120 * 29);
+	assert.equal(rows[0].props.children[0].props.children, '1.');
+});
+
 test('favorite rows expose a lightweight remove control without starting playback', () => {
 	const { FavoriteListPanel } = loadClient();
 	const events = [];
@@ -346,6 +369,16 @@ test('queue song row exposes one lightweight remove control that does not select
 	assert.ok(remove);
 	remove.props.onClick({ stopPropagation() { events.push('stop'); } });
 	assert.deepEqual(events, ['stop', 'remove:2']);
+});
+
+test('queue list preserves original indices while virtualizing long queues', () => {
+	const { QueueListPanel } = loadClient();
+	const items = Array.from({ length: 120 }, (_, index) => ({ id: index + 1, name: `歌曲${index + 1}`, artists: '歌手' }));
+	const tree = QueueListPanel({ items, currentIndex: 87, selectedIndex: 90 });
+	const rows = findNodes(tree, (node) => typeof node.props?.className === 'string' && node.props.className.includes('dsa-qitem'));
+	assert.equal(rows.length, 10, '130px queue viewport mounts only its initial overscanned rows');
+	assert.equal(rows[0].props.children[0].props.children, '1.');
+	assert.equal(findNodes(tree, (node) => node.props?.className === 'dsa-virtual-space')[0].props.style.height, 120 * 28);
 });
 
 test('search rows add by their catalog song id', () => {
