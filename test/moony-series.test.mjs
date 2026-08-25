@@ -710,6 +710,18 @@ test('recommendation remains actionable while the background pool is preparing',
 	assert.ok(findNodes(harness.tree(), (node) => node.props?.className === 'dsa-queue').length, 'the queue opens immediately while preparation continues');
 });
 
+test('audio completion retries a waiting radio boundary and exposes a lightweight queue hint', () => {
+	const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+	const endedHandler = source.slice(source.indexOf('audio.addEventListener("ended"'), source.indexOf('audio.addEventListener("error"'));
+	assert.match(endedHandler, /advancePlaybackRef\.current/);
+	assert.doesNotMatch(endedHandler, /command\("next"\)/);
+	assert.match(source, /r\s*&&\s*r\.preparing/);
+	assert.match(source, /radioRetryTimerRef/);
+	assert.match(source, /cancelRadioAdvance/);
+	assert.match(source, /正在准备下一批…/);
+	assert.match(source, /recommendation\.radio\.waitingForNextBatch/);
+});
+
 test('first use shows one lightweight Moony hint and stored acknowledgement suppresses it', () => {
 	const first = loadMusicPlayerHarness();
 	const hint = findNodes(first.tree(), (node) => node.props?.className === 'dsa-first-use-tip')[0];
