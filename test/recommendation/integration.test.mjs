@@ -169,16 +169,51 @@ test('strong preference signals schedule refresh while skip and completion only 
 	assert.deepEqual(feedback, ['favorite', 'unfavorite', 'skip-short']);
 });
 
-test('favorites route exposes one flat read-only song list', async () => {
+test('favorites route lists songs and removes one favorite without touching playback', async () => {
 	const routes = [];
+	const calls = [];
 	registerRoutesForTest({ register: (route) => routes.push(route) }, {
-		favoritesList: async () => ({ ok: true, count: 1, songs: [{ id: 1, name: '晴天', artists: '周杰伦' }] })
+		favoritesList: async () => ({ ok: true, count: 1, songs: [{ id: 1, name: '晴天', artists: '周杰伦' }] }),
+		favoritesRemove: async (input) => { calls.push(input.songId); return { ok: true, removedId: input.songId, count: 0, songs: [] }; }
 	});
 	const route = routes.find((item) => item.path === '/dsh-alger/favorites');
 	assert.ok(route);
 	const res = response();
 	await route.handler(request({}), res);
 	assert.deepEqual(res.body, { ok: true, count: 1, songs: [{ id: 1, name: '晴天', artists: '周杰伦' }] });
+	const removeRes = response();
+	await route.handler(request({ action: 'remove', songId: 1 }), removeRes);
+	assert.deepEqual(calls, [1]);
+	assert.deepEqual(removeRes.body, { ok: true, removedId: 1, count: 0, songs: [] });
+});
+
+test('favorite removal action updates only favorites and schedules preference refresh', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([
+		{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] },
+		{ id: 2, name: '夜曲', ar: [{ name: '周杰伦' }] }
+	]);
+	player.toggleFavorite();
+	player.jump(1);
+	player.toggleFavorite();
+	const scheduled = [];
+	const feedback = [];
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ songUrl: async () => null }, {}, player, {}, { recordPlayback: async () => {} },
+		{
+			coordinator: { feedback: async (event) => feedback.push(event.type) },
+			scheduler: { schedule: (reason) => scheduled.push(reason), status: () => ({ state: 'idle' }) }
+		}
+	);
+	const queueBefore = player.state.queue.map((item) => item.id);
+	const result = await actions.favoritesRemove({ songId: 1 });
+	assert.equal(result.removedId, 1);
+	assert.deepEqual(result.songs.map((item) => item.id), [2]);
+	assert.deepEqual(player.state.queue.map((item) => item.id), queueBefore);
+	assert.equal(player.current().id, 2);
+	assert.deepEqual(feedback, ['unfavorite']);
+	assert.deepEqual(scheduled, ['unfavorite']);
 });
 
 test('real actions resolve playback after removing the current song', async () => {

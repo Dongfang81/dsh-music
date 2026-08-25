@@ -161,6 +161,25 @@ test('favorite list keeps the compact play icon directly after the song count', 
 	assert.deepEqual(events, ['all', 'from:1']);
 });
 
+test('favorite rows expose a lightweight remove control without starting playback', () => {
+	const { FavoriteListPanel } = loadClient();
+	const events = [];
+	const tree = FavoriteListPanel({
+		songs: [{ id: 1, name: '晴天', artists: '周杰伦' }],
+		onPlayFrom(index) { events.push(`play:${index}`); },
+		onRemove(song) { events.push(`remove:${song.id}`); }
+	});
+	const row = findNodes(tree, (node) => node.props?.className === 'dsa-favorite-row')[0];
+	const remove = findNodes(row, (node) => node.type === 'button' && node.props?.['aria-label'] === '取消收藏晴天')[0];
+	assert.equal(row.type, 'div', 'row must not nest a remove button inside another button');
+	assert.equal(row.props.role, 'button');
+	assert.ok(remove);
+	remove.props.onClick({ stopPropagation() { events.push('stop'); } });
+	assert.deepEqual(events, ['stop', 'remove:1']);
+	row.props.onClick();
+	assert.deepEqual(events, ['stop', 'remove:1', 'play:0']);
+});
+
 test('queue song row exposes one lightweight remove control that does not select the row', () => {
 	const { QueueSongRow } = loadClient();
 	const events = [];

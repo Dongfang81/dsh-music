@@ -102,6 +102,24 @@ test('playing favorites from one row keeps the full favorite list as playback co
 	assert.equal(player.state.index, 1);
 });
 
+test('removing a favorite by id preserves the current song and playback queue', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([song(1, '晴天'), song(2, '夜曲'), song(3, '七里香')]);
+	player.toggleFavorite();
+	player.jump(1);
+	player.toggleFavorite();
+	const queueBefore = player.state.queue.map((item) => item.id);
+	const currentBefore = player.current().id;
+
+	const result = player.removeFavorite(1);
+
+	assert.equal(result.removed.id, 1);
+	assert.deepEqual(result.favoriteIds, [2]);
+	assert.equal(result.count, 1);
+	assert.deepEqual(player.state.queue.map((item) => item.id), queueBefore);
+	assert.equal(player.current().id, currentBefore);
+});
+
 test('removing a non-current queue item preserves the active song and undo restores order', () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([song(1, '一'), song(2, '二'), song(3, '三'), song(4, '四')]);

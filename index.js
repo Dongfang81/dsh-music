@@ -404,6 +404,16 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			return { ok: true, count: songs.length, songs };
 		},
 
+		/** 从扁平收藏列表取消一首收藏，不影响当前播放上下文。 */
+		async favoritesRemove(args) {
+			const songId = Number(args?.songId);
+			if (!Number.isFinite(songId)) throw new Error('请提供有效的歌曲 id。');
+			const result = player.removeFavorite(songId);
+			if (result.removed) await feedback('unfavorite', result.removed);
+			const songs = player.state.favorites.map(compactSong);
+			return { ok: true, removedId: result.removed ? Number(result.removed.id) : null, count: songs.length, songs };
+		},
+
 		/** alger_song */
 		async song(args) {
 			const id = Number(args?.id);
@@ -1310,9 +1320,10 @@ function registerRoutes(webServer, actions) {
 		{
 			kind: 'exact',
 			path: '/dsh-alger/favorites',
-			handler: async (_req, res) => {
+			handler: async (req, res) => {
 				try {
-					json(res, await actions.favoritesList());
+					const body = JSON.parse((await readBody(req)) || '{}');
+					json(res, body.action === 'remove' ? await actions.favoritesRemove(body) : await actions.favoritesList());
 				} catch (error) {
 					json(res, { ok: false, error: String((error && error.message) || error) });
 				}

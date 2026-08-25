@@ -268,14 +268,25 @@ window.__ModuleLoader__.load({
 					h("button", { type: "button", className: "dsa-favorites-close", "aria-label": "关闭收藏列表", title: "关闭", onClick: props && props.onClose }, "×")
 				]),
 				h("div", { key: "songs", className: "dsa-favorites-songs" }, songs.length ? songs.map(function (song, index) {
-					return h("button", {
-						key: song.id + "-" + index, type: "button", className: "dsa-favorite-row",
-						title: "从这首开始播放", disabled: Boolean(props && props.busy),
-						onClick: function () { if (typeof props.onPlayFrom === "function") props.onPlayFrom(index); }
+					var play = function () {
+						if (!Boolean(props && props.busy) && typeof props.onPlayFrom === "function") props.onPlayFrom(index);
+					};
+					return h("div", {
+						key: song.id + "-" + index, className: "dsa-favorite-row", role: "button", tabIndex: 0,
+						"aria-disabled": Boolean(props && props.busy), title: "从这首开始播放", onClick: play,
+						onKeyDown: function (event) {
+							if (event.key === "Enter" || event.key === " ") { event.preventDefault(); play(); }
+						}
 					}, [
 						h("span", { className: "n" }, (index + 1) + "."),
 						h("span", { className: "t" }, song.name),
-						h("span", { className: "s" }, song.artists || "")
+						h("span", { className: "s" }, song.artists || ""),
+						h("button", {
+							type: "button", className: "dsa-favorite-remove", "aria-label": "取消收藏" + song.name,
+							title: "取消收藏", disabled: Boolean(props && props.busy),
+							onClick: function (event) { event.stopPropagation(); if (typeof props.onRemove === "function") props.onRemove(song); },
+							onDoubleClick: function (event) { event.stopPropagation(); }
+						}, "×")
 					]);
 				}) : h("div", { className: "dsa-favorites-empty" }, props && props.loading ? "正在读取收藏…" : "还没有收藏音乐，播放歌曲时点红心即可收藏。"))
 			]);
@@ -407,6 +418,7 @@ window.__ModuleLoader__.load({
 		var searchMusic = function (keywords, type) { return post("/dsh-alger/search", { keywords: keywords, type: type || 1, limit: 30 }); };
 		var queueApi = function (payload) { return post("/dsh-alger/queue", payload); };
 		var favoritesApi = function () { return post("/dsh-alger/favorites", {}); };
+		var removeFavoriteApi = function (songId) { return post("/dsh-alger/favorites", { action: "remove", songId: songId }); };
 		var setupApp = function (action) { return post("/dsh-alger/setup", { action: action }); };
 		var getLyric = function (id) { return post("/dsh-alger/lyric", { id: id }); };
 		var getArtist = function (id) { return post("/dsh-alger/artist", { id: id }); };
@@ -798,7 +810,7 @@ window.__ModuleLoader__.load({
 			".dsa-favorites{margin-top:7px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.05);overflow:hidden}",
 			".dsa-favorites-head{height:32px;display:flex;align-items:center;gap:6px;padding:0 7px;border-bottom:1px solid rgba(255,255,255,.08)}.dsa-favorites-head strong{font-size:11px}.dsa-favorites-count{font-size:9.5px;color:rgba(255,255,255,.5)}",
 			".dsa-favorites-play,.dsa-favorites-close{width:22px;height:22px;border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.8);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}.dsa-favorites-play{font-size:9px}.dsa-favorites-play:hover,.dsa-favorites-close:hover{background:rgba(255,255,255,.13);color:#fff}.dsa-favorites-play:disabled{opacity:.3;cursor:not-allowed}.dsa-favorites-close{margin-left:auto;font-size:14px}",
-			".dsa-favorites-songs{max-height:205px;overflow-y:auto;padding:3px;scrollbar-width:thin}.dsa-favorite-row{width:100%;height:29px;border:0;border-radius:7px;background:transparent;color:#fff;display:flex;align-items:center;gap:6px;padding:0 6px;text-align:left;cursor:pointer}.dsa-favorite-row:hover{background:rgba(255,255,255,.1)}.dsa-favorite-row .n{width:20px;flex:none;font-size:9.5px;color:rgba(255,255,255,.38);text-align:right}.dsa-favorite-row .t{flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-row .s{max-width:88px;font-size:9.5px;color:rgba(255,255,255,.52);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorites-empty{padding:18px 10px;text-align:center;font-size:10px;line-height:1.5;color:rgba(255,255,255,.45)}",
+			".dsa-favorites-songs{max-height:205px;overflow-y:auto;padding:3px;scrollbar-width:thin}.dsa-favorite-row{width:100%;height:29px;border:0;border-radius:7px;background:transparent;color:#fff;display:flex;align-items:center;gap:6px;padding:0 6px;text-align:left;cursor:pointer}.dsa-favorite-row:hover{background:rgba(255,255,255,.1)}.dsa-favorite-row[aria-disabled=true]{cursor:default;opacity:.65}.dsa-favorite-row .n{width:20px;flex:none;font-size:9.5px;color:rgba(255,255,255,.38);text-align:right}.dsa-favorite-row .t{flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-row .s{max-width:88px;font-size:9.5px;color:rgba(255,255,255,.52);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-remove{flex:none;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.55);font-size:15px;line-height:16px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .14s,background .14s}.dsa-favorite-row:hover .dsa-favorite-remove,.dsa-favorite-remove:focus-visible{opacity:1;pointer-events:auto}.dsa-favorite-remove:hover{background:rgba(239,68,68,.2);color:#fca5a5}.dsa-favorites-empty{padding:18px 10px;text-align:center;font-size:10px;line-height:1.5;color:rgba(255,255,255,.45)}",
 			".dsa-notice{margin-top:7px;padding:5px 9px;border-radius:8px;font-size:11px;line-height:1.45;background:rgba(245,158,11,0.16);border:1px solid rgba(245,158,11,0.35);color:#fcd34d}",
 			".dsa-notice.ok{background:rgba(52,211,153,0.14);border-color:rgba(52,211,153,0.35);color:#6ee7b7}",
 			".dsa-notice.err{background:rgba(239,68,68,0.14);border-color:rgba(239,68,68,0.35);color:#fca5a5}",
@@ -1480,6 +1492,19 @@ window.__ModuleLoader__.load({
 					setTimeout(refresh, 500);
 				}).catch(function () { setBusy(false); flash("err", "播放收藏失败"); });
 			};
+			var removeFavorite = function (song) {
+				if (!song || !Number.isFinite(Number(song.id))) return;
+				var previous = favoriteSongs || [];
+				setFavoriteSongs(previous.filter(function (item) { return Number(item.id) !== Number(song.id); }));
+				removeFavoriteApi(song.id).then(function (r) {
+					if (!r || r.ok === false) throw new Error((r && r.error) || "取消收藏失败");
+					setFavoriteSongs(r.songs || []);
+					setTimeout(refresh, 120);
+				}).catch(function (error) {
+					setFavoriteSongs(previous);
+					flash("err", error.message || "取消收藏失败");
+				});
+			};
 
 			var onSearch = function (forcedType) {
 				var q = query.trim();
@@ -2060,6 +2085,7 @@ window.__ModuleLoader__.load({
 							busy: busy,
 							onPlayAll: function () { playFavoritesFrom(0); },
 							onPlayFrom: playFavoritesFrom,
+							onRemove: removeFavorite,
 							onClose: function () { setFavoritesOpen(false); }
 						}) : null,
 						// 播放列表
