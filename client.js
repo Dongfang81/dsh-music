@@ -223,12 +223,13 @@ window.__ModuleLoader__.load({
 			return { update: update, dispose: dispose };
 		}
 		/** 展开宽度。 */
-		var WIDTH = 280;
+		var WIDTH = 304;
 		/** 本地存储键。 */
 		var STORE_X = "dsh-alger:x";
 		var STORE_Y = "dsh-alger:y";
 		var STORE_MOONY_ID = "dsh-moony-singer:pet-id:v1";
 		var STORE_PET_SCALE = "dsh-moony-singer:pet-scale:v1";
+		var STORE_ONBOARDING = "dsh-moony-singer:onboarding:v1";
 		var PET_SCALE_MIN = 0.6;
 		var PET_SCALE_MAX = 1.8;
 		var PET_SCALE_STEP = 0.1;
@@ -396,6 +397,25 @@ window.__ModuleLoader__.load({
 			return safeId;
 		}
 
+		function readOnboardingSeen(storage) {
+			try { return Boolean(storage && storage.getItem(STORE_ONBOARDING) === "seen"); }
+			catch { return false; }
+		}
+
+		function markOnboardingSeen(storage) {
+			try { if (storage) storage.setItem(STORE_ONBOARDING, "seen"); } catch { /* hint still works for this session */ }
+		}
+
+		function artistText(value) {
+			var parts = Array.isArray(value) ? value : [value];
+			var names = parts.map(function (entry) {
+				if (typeof entry === "string") return entry.trim();
+				if (entry && typeof entry.name === "string") return entry.name.trim();
+				return "";
+			}).filter(function (name) { return name && !/^\[object Object\]$/i.test(name); });
+			return names.length > 0 ? names.join(" / ") : "未知歌手";
+		}
+
 		function MoonyThumbnail(props) {
 			var pet = getMoony(props && props.petId);
 			var style = {
@@ -503,7 +523,7 @@ window.__ModuleLoader__.load({
 					}, [
 						h("span", { className: "n" }, (index + 1) + "."),
 						h("span", { className: "t" }, song.name),
-						h("span", { className: "s" }, song.artists || ""),
+						h("span", { className: "s" }, artistText(song.artists)),
 						h("button", {
 							type: "button", className: "dsa-favorite-remove", "aria-label": "取消收藏" + song.name,
 							title: "取消收藏", disabled: Boolean(props && props.busy),
@@ -532,14 +552,13 @@ window.__ModuleLoader__.load({
 			var item = props.item || {};
 			var index = Number(props.index);
 			return h("div", {
-				className: "dsa-qitem" + (props.current ? " cur" : "") + (props.selected && !props.current ? " sel" : ""),
-				title: "单击选中，双击播放",
-				onClick: function () { if (typeof props.onSelect === "function") props.onSelect(index); },
-				onDoubleClick: function () { if (typeof props.onJump === "function") props.onJump(index); }
+				className: "dsa-qitem" + (props.current ? " cur" : ""),
+				title: "单击播放",
+				onClick: function () { if (typeof props.onJump === "function") props.onJump(index); }
 			}, [
 				h("span", { key: "number", className: "n" }, (index + 1) + "."),
 				h("span", { key: "title", className: "t" }, item.name),
-				h("span", { key: "artist", className: "s" }, item.artists || ""),
+				h("span", { key: "artist", className: "s" }, artistText(item.artists)),
 				h("button", {
 					key: "remove", type: "button", className: "dsa-qremove", "aria-label": "从播放列表移除", title: "从播放列表移除",
 					onClick: function (event) { event.stopPropagation(); if (typeof props.onRemove === "function") props.onRemove(index); },
@@ -563,8 +582,6 @@ window.__ModuleLoader__.load({
 						return QueueSongRow({
 							key: item.id + "-" + index, item: item, index: index,
 							current: index === props.currentIndex,
-							selected: index === props.selectedIndex,
-							onSelect: props.onSelect,
 							onJump: props.onJump,
 							onRemove: props.onRemove
 						});
@@ -584,9 +601,35 @@ window.__ModuleLoader__.load({
 			return { action: "add", songId: item && item.id };
 		}
 
+		function SearchResultRow(props) {
+			var item = props && props.item ? props.item : {};
+			var isPlaylist = Boolean(props && props.playlist);
+			return h("div", {
+				className: "dsa-item",
+				title: "单击播放 " + (item.name || ""),
+				onClick: function () { if (props && typeof props.onPlay === "function") props.onPlay(item); }
+			}, [
+				h("span", { key: "title", className: "t" }, item.name),
+				h("span", { key: "subtitle", className: "s" }, isPlaylist ? (item.desc || "") : artistText(item.artists)),
+				!isPlaylist && item.durationMs
+					? h("span", { key: "duration", className: "p" }, Math.floor(item.durationMs / 60000) + ":" + String(Math.floor(item.durationMs / 1000) % 60).padStart(2, "0"))
+					: null,
+				h("button", {
+					key: "add", type: "button", className: "dsa-item-add",
+					"aria-label": "仅加入播放列表：" + (item.name || ""), title: "仅加入播放列表",
+					onClick: function (event) { event.stopPropagation(); if (props && typeof props.onAdd === "function") props.onAdd(item); }
+				}, "+")
+			]);
+		}
+
 		function searchFeedbackForResponse(response) {
 			if (!response || response.ok === false || !Array.isArray(response.items) || response.items.length > 0) return null;
 			return response.guidance || "没有找到可靠的音乐结果。";
+		}
+
+		function SearchFeedbackPanel(props) {
+			var message = props && typeof props.message === "string" ? props.message.trim() : "";
+			return message ? h("div", { className: "dsa-search-feedback", role: "status" }, message) : null;
 		}
 
 		/* ---------- 微信分享面板（朋友无需安装插件） ----------
@@ -1057,14 +1100,14 @@ window.__ModuleLoader__.load({
 			".dsa-cover img{width:100%;height:100%;object-fit:cover}",
 			".dsa-meta{flex:1;min-width:0}",
 			".dsa-title{font-size:13px;font-weight:600;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 1px 4px rgba(0,0,0,0.4)}",
-			".dsa-artist{font-size:10.5px;line-height:14px;color:rgba(255,255,255,0.75);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+			".dsa-artist{font-size:11px;line-height:15px;color:rgba(255,255,255,0.75);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
 			".dsa-actions{flex:none;display:flex;align-items:center;gap:2px}",
 			".dsa-btn{flex:none;width:26px;height:26px;border:none;border-radius:8px;background:transparent;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:13px;padding:0;text-shadow:0 1px 3px rgba(0,0,0,0.35)}",
 			".dsa-btn:hover{background:rgba(255,255,255,0.16)}",
 			".dsa-btn:disabled{opacity:0.35;cursor:not-allowed}",
 			".dsa-btn-primary{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,rgba(255,255,255,0.95),rgba(255,255,255,0.72));color:#11131f;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,0.35)}",
 			".dsa-btn-primary:hover{filter:brightness(1.05)}",
-			".dsa-mode{font-size:10px;min-width:32px;padding:0 3px;color:rgba(255,255,255,0.85)}",
+			".dsa-mode{font-size:10.5px;min-width:32px;padding:0 3px;color:rgba(255,255,255,0.85)}",
 			".dsa-favorites-toggle.active{background:rgba(255,255,255,.13);color:#fff}",
 			".dsa-mode-icon{width:24px;height:24px;color:rgba(255,255,255,0.8)}",
 			".dsa-shape-wrap{position:relative;display:flex;align-items:stretch;border-radius:9px;background:linear-gradient(135deg,#fbbf24,#f97316);box-shadow:0 0 10px rgba(251,146,60,0.55),0 2px 8px rgba(0,0,0,0.3);transition:filter .15s,box-shadow .15s}.dsa-shape-wrap:hover{filter:brightness(1.08);box-shadow:0 0 16px rgba(251,146,60,0.8),0 2px 10px rgba(0,0,0,0.35)}",
@@ -1075,7 +1118,7 @@ window.__ModuleLoader__.load({
 			".dsa-body{padding:2px 12px 12px}",
 			".dsa-controls{display:flex;align-items:center;justify-content:center;gap:3px;margin-top:4px}",
 			".dsa-progress{display:flex;align-items:center;gap:7px;margin-top:6px}",
-			".dsa-progress .tp{flex:none;min-width:30px;font-size:9.5px;color:rgba(255,255,255,0.55);text-align:center;font-variant-numeric:tabular-nums}",
+			".dsa-progress .tp{flex:none;min-width:30px;font-size:10px;color:rgba(255,255,255,0.55);text-align:center;font-variant-numeric:tabular-nums}",
 			".dsa-range{flex:1;min-width:0;height:3px;-webkit-appearance:none;appearance:none;background:rgba(255,255,255,0.18);border-radius:3px;outline:none;cursor:pointer}",
 			".dsa-range::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:11px;height:11px;border-radius:50%;background:#fff;border:none;box-shadow:0 1px 4px rgba(0,0,0,0.45)}",
 			".dsa-range:disabled{opacity:0.4;cursor:not-allowed}",
@@ -1102,10 +1145,12 @@ window.__ModuleLoader__.load({
 			".dsa-item .t{flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
 			".dsa-item .s{font-size:10px;color:rgba(255,255,255,0.6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px}",
 			".dsa-item .p{font-size:10px;color:rgba(255,255,255,0.45);flex:none}",
+			".dsa-item-add{flex:none;width:19px;height:19px;padding:0;border:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.65);font-size:15px;line-height:18px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .14s,background .14s}.dsa-item:hover .dsa-item-add,.dsa-item-add:focus-visible{opacity:1;pointer-events:auto}.dsa-item-add:hover{background:rgba(96,165,250,.22);color:#bfdbfe}",
+			".dsa-search-feedback{margin-top:6px;padding:8px 9px;border-radius:8px;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.24);color:#fde68a;font-size:11px;line-height:1.45}",
 			".dsa-favorites{margin-top:7px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.05);overflow:hidden}",
-			".dsa-favorites-head{height:32px;display:flex;align-items:center;gap:6px;padding:0 7px;border-bottom:1px solid rgba(255,255,255,.08)}.dsa-favorites-head strong{font-size:11px}.dsa-favorites-count{font-size:9.5px;color:rgba(255,255,255,.5)}",
+			".dsa-favorites-head{height:32px;display:flex;align-items:center;gap:6px;padding:0 7px;border-bottom:1px solid rgba(255,255,255,.08)}.dsa-favorites-head strong{font-size:11.5px}.dsa-favorites-count{font-size:10px;color:rgba(255,255,255,.5)}",
 			".dsa-favorites-play,.dsa-favorites-close{width:22px;height:22px;border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.8);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}.dsa-favorites-play{font-size:9px}.dsa-favorites-play:hover,.dsa-favorites-close:hover{background:rgba(255,255,255,.13);color:#fff}.dsa-favorites-play:disabled{opacity:.3;cursor:not-allowed}.dsa-favorites-close{margin-left:auto;font-size:14px}",
-			".dsa-favorites-songs{max-height:205px;overflow-y:auto;padding:3px;scrollbar-width:thin}.dsa-favorite-row{box-sizing:border-box;width:100%;height:29px;border:0;border-radius:7px;background:transparent;color:#fff;display:flex;align-items:center;gap:6px;padding:0 6px;text-align:left;cursor:pointer}.dsa-favorite-row:hover{background:rgba(255,255,255,.1)}.dsa-favorite-row[aria-disabled=true]{cursor:default;opacity:.65}.dsa-favorite-row .n{width:20px;flex:none;font-size:9.5px;color:rgba(255,255,255,.38);text-align:right}.dsa-favorite-row .t{flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-row .s{max-width:88px;font-size:9.5px;color:rgba(255,255,255,.52);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-remove{flex:none;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.55);font-size:15px;line-height:16px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .14s,background .14s}.dsa-favorite-row:hover .dsa-favorite-remove,.dsa-favorite-remove:focus-visible{opacity:1;pointer-events:auto}.dsa-favorite-remove:hover{background:rgba(239,68,68,.2);color:#fca5a5}.dsa-favorites-empty{padding:18px 10px;text-align:center;font-size:10px;line-height:1.5;color:rgba(255,255,255,.45)}",
+			".dsa-favorites-songs{max-height:205px;overflow-y:auto;padding:3px;scrollbar-width:thin}.dsa-favorite-row{box-sizing:border-box;width:100%;height:29px;border:0;border-radius:7px;background:transparent;color:#fff;display:flex;align-items:center;gap:6px;padding:0 6px;text-align:left;cursor:pointer}.dsa-favorite-row:hover{background:rgba(255,255,255,.1)}.dsa-favorite-row[aria-disabled=true]{cursor:default;opacity:.65}.dsa-favorite-row .n{width:20px;flex:none;font-size:10px;color:rgba(255,255,255,.38);text-align:right}.dsa-favorite-row .t{flex:1;min-width:0;font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-row .s{max-width:96px;font-size:10px;color:rgba(255,255,255,.52);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsa-favorite-remove{flex:none;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.55);font-size:15px;line-height:16px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .14s,background .14s}.dsa-favorite-row:hover .dsa-favorite-remove,.dsa-favorite-remove:focus-visible{opacity:1;pointer-events:auto}.dsa-favorite-remove:hover{background:rgba(239,68,68,.2);color:#fca5a5}.dsa-favorites-empty{padding:18px 10px;text-align:center;font-size:10.5px;line-height:1.5;color:rgba(255,255,255,.45)}",
 			".dsa-virtual-space{position:relative;width:100%}.dsa-virtual-window{position:absolute;left:0;right:0;top:0}",
 			".dsa-notice{margin-top:7px;padding:5px 9px;border-radius:8px;font-size:11px;line-height:1.45;background:rgba(245,158,11,0.16);border:1px solid rgba(245,158,11,0.35);color:#fcd34d}",
 			".dsa-notice.ok{background:rgba(52,211,153,0.14);border-color:rgba(52,211,153,0.35);color:#6ee7b7}",
@@ -1143,7 +1188,7 @@ window.__ModuleLoader__.load({
 			".dsa-close-results{flex:none;width:22px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:rgba(255,255,255,0.5);border-radius:8px;font-size:10px;padding:3px 0;cursor:pointer}",
 			".dsa-close-results:hover{background:rgba(255,255,255,0.1);color:#fff}",
 			".dsa-queue{margin-top:8px;border:1px solid rgba(255,255,255,0.12);border-radius:10px;background:rgba(255,255,255,0.05)}",
-			".dsa-queue-title{display:flex;align-items:center;gap:6px;padding:6px 9px;font-size:11px;font-weight:600;color:rgba(255,255,255,0.85);cursor:pointer}",
+			".dsa-queue-title{display:flex;align-items:center;gap:6px;padding:6px 9px;font-size:11.5px;font-weight:600;color:rgba(255,255,255,0.85);cursor:pointer}",
 			".dsa-queue-title .cnt{color:rgba(255,255,255,0.5);font-weight:400}",
 			".dsa-queue-title .fold{margin-left:auto;color:rgba(255,255,255,0.5)}",
 			".dsa-qclear-row{padding:3px 6px 4px;border-top:1px dashed rgba(255,255,255,0.08);margin-top:2px;text-align:center}",
@@ -1151,19 +1196,21 @@ window.__ModuleLoader__.load({
 			".dsa-qclear:hover{color:rgba(255,255,255,0.6);background:rgba(255,255,255,0.06)}",
 			".dsa-qclear:disabled{opacity:0.3;cursor:not-allowed}",
 			".dsa-queue-list{max-height:130px;overflow-y:auto;padding:0 6px;scrollbar-width:thin}",
-			".dsa-qitem{box-sizing:border-box;height:28px;display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:7px;font-size:11px;color:rgba(255,255,255,0.8);cursor:pointer}",
+			".dsa-qitem{box-sizing:border-box;height:28px;display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:7px;font-size:11.5px;color:rgba(255,255,255,0.8);cursor:pointer}",
 			".dsa-qitem:hover{background:rgba(255,255,255,0.08)}",
 			".dsa-qitem.cur{background:rgba(59,130,246,0.22);color:#fff}",
 			".dsa-qitem.sel{box-shadow:inset 0 0 0 1px rgba(255,255,255,0.5);background:rgba(255,255,255,0.12);color:#fff}",
 			".dsa-qitem .n{flex:none;width:16px;text-align:right;color:rgba(255,255,255,0.4);font-size:10px}",
 			".dsa-qitem .t{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-			".dsa-qitem .s{font-size:10px;color:rgba(255,255,255,0.5);max-width:80px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+			".dsa-qitem .s{font-size:10.5px;color:rgba(255,255,255,0.5);max-width:92px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
 			".dsa-qremove{flex:none;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.55);font-size:15px;line-height:16px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .14s,background .14s}.dsa-qitem:hover .dsa-qremove,.dsa-qremove:focus-visible{opacity:1;pointer-events:auto}.dsa-qremove:hover{background:rgba(239,68,68,.2);color:#fca5a5}",
 			".dsa-addall{margin-top:6px;width:100%;border:1px dashed rgba(255,255,255,0.25);background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.85);border-radius:8px;font-size:11px;padding:4px 0;cursor:pointer}",
 			".dsa-addall:hover{background:rgba(255,255,255,0.12)}",
 			".dsa-addall:disabled{opacity:0.5;cursor:not-allowed}",
 			/* ---- 宠物（收起态）：宠物固定，气泡锚定在左/右侧（自动换边） ---- */
 			".dsa-pet-wrap{position:fixed;z-index:2147483000;width:64px;height:64px;user-select:none}",
+			".dsa-first-use-tip{position:absolute;left:50%;bottom:76px;translate:-50% 0;padding:6px 10px;border:1px solid rgba(255,255,255,.2);border-radius:999px;background:rgba(13,15,24,.9);box-shadow:0 8px 24px rgba(0,0,0,.32);color:rgba(255,255,255,.88);font-size:11px;line-height:1.2;white-space:nowrap;pointer-events:none;animation:dsa-first-use-tip 6.5s ease both}",
+			"@keyframes dsa-first-use-tip{0%{opacity:0;translate:-50% 4px}8%,82%{opacity:1;translate:-50% 0}100%{opacity:0;translate:-50% -3px}}",
 			".dsa-pet-scale{position:absolute;left:0;top:0;width:64px;height:64px;will-change:transform;transition:transform .12s ease-out}",
 			".dsa-pet-bubble-pos{position:absolute;top:50%;transform:translateY(-50%);display:flex;align-items:center}",
 			".dsa-pet-bubble-pos.right{left:74px}",
@@ -1364,9 +1411,9 @@ window.__ModuleLoader__.load({
 			var [searched, setSearched] = React.useState(false); // 是否已搜索过（控制歌曲/歌单 tab 显隐）
 			var [searching, setSearching] = React.useState(false);
 			var [results, setResults] = React.useState(null);
+			var [searchFeedback, setSearchFeedback] = React.useState(null);
 			var [queueOpen, setQueueOpen] = React.useState(false);
 			var [queueView, setQueueView] = React.useState(null);
-			var [selectedIdx, setSelectedIdx] = React.useState(null); // 播放列表"单击选中"的行
 			var [favOptimistic, setFavOptimistic] = React.useState(null); // 收藏乐观状态（null=跟随真实状态）
 			var [favoritesOpen, setFavoritesOpen] = React.useState(false);
 			var [favoriteSongs, setFavoriteSongs] = React.useState(null);
@@ -1391,6 +1438,13 @@ window.__ModuleLoader__.load({
 			var lrcFor = React.useRef(null); // 已取歌词的 songId
 			var artistFor = React.useRef(null); // 已取头像的 artistId
 			var suppressClickRef = React.useRef(false);
+			var [showFirstUseTip, setShowFirstUseTip] = React.useState(function () { return !readOnboardingSeen(getLocalStorage()); });
+			React.useEffect(function () {
+				if (!showFirstUseTip) return;
+				markOnboardingSeen(getLocalStorage());
+				var timer = setTimeout(function () { setShowFirstUseTip(false); }, 6500);
+				return function () { clearTimeout(timer); };
+			}, [showFirstUseTip]);
 
 			var flash = function (kind, text) {
 				setNotice({ kind: kind || "", text: text });
@@ -1810,14 +1864,13 @@ window.__ModuleLoader__.load({
 			// 推荐播放：不知道听什么时一键推荐
 			var onRecommend = function () {
 				if (!state || !state.musicApiUp) { flash("err", "音乐服务未就绪，请先点“连接”"); return; }
-				if (!state.recommendation || !state.recommendation.ready) { flash("", "推荐正在准备中"); return; }
 				var requestId = "recommend-" + Date.now() + "-" + (recommendRequestRef.current + 1);
 				recommendRequestRef.current = requestId;
 				setFavoritesOpen(false);
 				setQueueOpen(true);
 				setResults(null);
 				setSearched(false);
-				setSelectedIdx(null);
+				setSearchFeedback(null);
 				setRecommendBusy(true);
 				post("/dsh-alger/recommend", { requestId: requestId }).then(function (r) {
 					if (recommendRequestRef.current !== requestId) return;
@@ -1855,6 +1908,7 @@ window.__ModuleLoader__.load({
 				setQueueOpen(false);
 				setResults(null);
 				setSearched(false);
+				setSearchFeedback(null);
 			};
 			// 播放全部或从收藏中的指定歌曲开始；收藏面板保持打开。
 			var playFavoritesFrom = function (index) {
@@ -1892,22 +1946,23 @@ window.__ModuleLoader__.load({
 				setSearched(true);
 				setSearching(true);
 				setResults(null);
+				setSearchFeedback(null);
 				searchMusic(q, t).then(function (r) {
 					setSearching(false);
 					if (!r || r.ok === false) { flash("err", (r && r.error) || "搜索失败"); setResults(null); return; }
 					setResults(r.items || []);
-					var searchFeedback = searchFeedbackForResponse(r);
-					if (searchFeedback) flash("err", searchFeedback);
+					setSearchFeedback(searchFeedbackForResponse(r));
 				}).catch(function () { setSearching(false); flash("err", "搜索失败"); });
 			};
 
 			var switchType = function (type) {
 				setSearchType(type);
 				setResults(null);
+				setSearchFeedback(null);
 				if (query.trim()) setTimeout(function () { onSearch(type); }, 0);
 			};
 
-			// 双击歌曲：追加到播放列表末尾并立即播放（不关闭搜索列表，可连续双击多首）
+			// 单击歌曲：追加到播放列表末尾并立即播放（不关闭搜索列表，可连续点播多首）
 			var onPlaySong = function (item) {
 				setBusy(true);
 				queueApi(queuePayloadForSearchItem(item)).then(function (r) {
@@ -1922,6 +1977,17 @@ window.__ModuleLoader__.load({
 						setTimeout(refresh, 600);
 					});
 				}).catch(function () { setBusy(false); flash("err", "添加失败"); });
+			};
+
+			var onAddSong = function (item) {
+				setBusy(true);
+				queueApi(queuePayloadForSearchItem(item)).then(function (r) {
+					setBusy(false);
+					if (!r || !r.ok) { flash("err", (r && r.guidance) || (r && r.error) || "加入失败"); return; }
+					setQueueOpen(true);
+					flash("ok", "已加入播放列表");
+					setTimeout(refresh, 300);
+				}).catch(function () { setBusy(false); flash("err", "加入失败"); });
 			};
 
 			var onAddAll = function () {
@@ -1946,7 +2012,7 @@ window.__ModuleLoader__.load({
 				}).catch(function () { setBusy(false); flash("err", "加入失败"); });
 			};
 
-			// 双击歌单：整单追加到播放列表末尾并立即播放第一首（不关闭搜索列表）
+			// 单击歌单：整单追加到播放列表末尾并立即播放第一首（不关闭搜索列表）
 			var onPlayPlaylist = function (item) {
 				setBusy(true);
 				queueApi({ action: "playlist-add", playlistId: item.id }).then(function (r) {
@@ -1964,10 +2030,18 @@ window.__ModuleLoader__.load({
 				}).catch(function () { setBusy(false); flash("err", "添加失败"); });
 			};
 
-			// 播放列表：单击选中、双击跳转播放（保留队列）
-			var onQueueSelect = function (i) {
-				setSelectedIdx(i === selectedIdx ? null : i);
+			var onAddPlaylist = function (item) {
+				setBusy(true);
+				queueApi({ action: "playlist-add", playlistId: item.id }).then(function (r) {
+					setBusy(false);
+					if (!r || !r.ok) { flash("err", (r && r.guidance) || (r && r.error) || "加入失败"); return; }
+					setQueueOpen(true);
+					flash("ok", "歌单已加入播放列表");
+					setTimeout(refresh, 300);
+				}).catch(function () { setBusy(false); flash("err", "加入失败"); });
 			};
+
+			// 播放列表：单击直接跳转播放（保留队列）
 			var onQueueJump = function (i) {
 				setBusy(true);
 				queueApi({ action: "jump", index: i }).then(function (r) {
@@ -2003,7 +2077,6 @@ window.__ModuleLoader__.load({
 			var onQueueRemove = function (index) {
 				queueApi({ action: "remove", index: index }).then(function (r) {
 					if (!r || r.ok === false) { flash("err", (r && r.error) || "移除失败"); return; }
-					setSelectedIdx(null);
 					setNotice({ kind: "", text: "已从播放列表移除“" + ((r.removed && r.removed.name) || "歌曲") + "”", undoToken: r.token });
 					if (noticeTimer.current) clearTimeout(noticeTimer.current);
 					noticeTimer.current = setTimeout(function () { setNotice(null); }, 6000);
@@ -2029,7 +2102,7 @@ window.__ModuleLoader__.load({
 			var albumArtwork = playing && playing.albumPic ? playing.albumPic : null;
 			var dot = readyDot(state);
 			var title = playing ? playing.name : "未在播放";
-			var artist = playing ? (playing.artists || "") : (state && state.musicApiUp ? "月宝儿 Moony" : "播放器未连接");
+			var artist = playing ? artistText(playing.artists) : (state && state.musicApiUp ? "月宝儿 Moony" : "播放器未连接");
 			var canControl = Boolean(state && state.musicApiUp);
 
 			// 唱片环境光：小尺寸采样，跨域、解码或 Canvas 失败均静默回退角色本色。
@@ -2194,6 +2267,7 @@ window.__ModuleLoader__.load({
 					onWheel: onPetWheel,
 					title: "滚轮缩放宠物（" + Math.round(petScale * 100) + "%）"
 				}, [
+					showFirstUseTip ? h("div", { className: "dsa-first-use-tip" }, "可拖拽移动 · 点击月宝展开播放器") : null,
 					h("div", {
 						ref: bubbleRef,
 						className: "dsa-pet-bubble-pos " + bubbleSide,
@@ -2305,7 +2379,7 @@ window.__ModuleLoader__.load({
 							h("button", {
 								className: "dsa-btn dsa-mode",
 								title: state && state.recommendation && state.recommendation.ready ? "立即推荐 30 首并播放" : "后台正在准备推荐",
-								disabled: !canControl || busy || recommendBusy || !(state && state.recommendation && state.recommendation.ready),
+								disabled: !canControl || busy || recommendBusy,
 								onClick: onRecommend
 							}, "推荐"),
 														h("button", { className: "dsa-btn", title: "上一首", disabled: !canControl, onClick: function () { runCommand("prev"); } }, ICONS.prev),
@@ -2407,7 +2481,7 @@ window.__ModuleLoader__.load({
 									])
 							)
 						]),
-						// 搜索结果（搜索后出现歌曲/歌单 tab + 关闭按钮；歌曲：双击播放 + 加入；歌单：双击播放歌单 + 整单加入）
+						// 搜索结果（搜索后出现歌曲/歌单 tab + 关闭按钮；单击播放，悬停“+”仅加入）
 						searched
 							? h("div", { className: "dsa-types" }, [
 									h("button", { className: "dsa-type" + (searchType === 1 ? " active" : ""), onClick: function () { switchType(1); } }, "歌曲"),
@@ -2419,6 +2493,7 @@ window.__ModuleLoader__.load({
 											setResults(null);
 											setSearched(false);
 											setQuery("");
+											setSearchFeedback(null);
 											setQueueOpen(true); // 关闭搜索：展开播放列表回到浏览态
 										}
 									}, "✕")
@@ -2430,30 +2505,15 @@ window.__ModuleLoader__.load({
 										? h("button", { className: "dsa-addall", disabled: busy, onClick: onAddAll }, "＋ 一键加入播放列表")
 										: null,
 									results.map(function (item) {
-										if (searchType === 1) {
-											return h("div", {
-												key: item.id,
-												className: "dsa-item",
-												title: "双击：添加并播放 " + item.name,
-												onDoubleClick: function () { onPlaySong(item); }
-											}, [
-												h("span", { className: "t" }, item.name),
-												h("span", { className: "s" }, item.artists || ""),
-												h("span", { className: "p" }, item.durationMs ? Math.floor(item.durationMs / 60000) + ":" + String(Math.floor(item.durationMs / 1000) % 60).padStart(2, "0") : "")
-											]);
-										}
-										return h("div", {
-											key: item.id,
-											className: "dsa-item",
-											title: "双击：添加歌单并播放 " + item.name,
-											onDoubleClick: function () { onPlayPlaylist(item); }
-										}, [
-											h("span", { className: "t" }, item.name),
-											h("span", { className: "s" }, item.desc || "")
-										]);
+										return h(SearchResultRow, {
+											key: item.id, item: item, playlist: searchType !== 1,
+											onPlay: searchType === 1 ? onPlaySong : onPlayPlaylist,
+											onAdd: searchType === 1 ? onAddSong : onAddPlaylist
+										});
 									})
 								])
 							: null,
+						h(SearchFeedbackPanel, { message: searchFeedback }),
 						favoritesOpen ? h(FavoriteListPanel, {
 							songs: favoriteSongs || [],
 							loading: favoritesLoading,
@@ -2476,9 +2536,7 @@ window.__ModuleLoader__.load({
 										items: queueView && Array.isArray(queueView.items) ? queueView.items : [],
 										loading: !(queueView && Array.isArray(queueView.items)),
 										currentIndex: state.queue.index,
-										selectedIndex: selectedIdx,
 										busy: busy,
-										onSelect: onQueueSelect,
 										onJump: onQueueJump,
 										onRemove: onQueueRemove,
 										onClear: onQueueClear
@@ -2558,6 +2616,8 @@ window.__ModuleLoader__.load({
 		exports.moonyForAudio = moonyForAudio;
 		exports.petForLyricDensity = petForLyricDensity;
 		exports.MOONY_CSS = MOONY_CSS;
+		exports.PLAYER_CSS = CSS;
+		exports.PLAYER_WIDTH = WIDTH;
 		exports.MOONY_CATALOG = MOONY_CATALOG;
 		exports.MOONY_STATUS = MOONY_STATUS;
 		exports.getMoony = getMoony;
@@ -2574,6 +2634,9 @@ window.__ModuleLoader__.load({
 		exports.FavoriteListPanel = FavoriteListPanel;
 		exports.QueueSongRow = QueueSongRow;
 		exports.QueueListPanel = QueueListPanel;
+		exports.SearchResultRow = SearchResultRow;
+		exports.SearchFeedbackPanel = SearchFeedbackPanel;
+		exports.artistText = artistText;
 		exports.queuePayloadForSearchItem = queuePayloadForSearchItem;
 		exports.searchFeedbackForResponse = searchFeedbackForResponse;
 		return module.exports;

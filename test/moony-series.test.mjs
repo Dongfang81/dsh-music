@@ -369,6 +369,33 @@ test('queue song row exposes one lightweight remove control that does not select
 	assert.ok(remove);
 	remove.props.onClick({ stopPropagation() { events.push('stop'); } });
 	assert.deepEqual(events, ['stop', 'remove:2']);
+	tree.props.onClick();
+	assert.deepEqual(events, ['stop', 'remove:2', 'jump'], 'one click plays instead of creating a selection-only state');
+	assert.equal(tree.props.onDoubleClick, undefined);
+});
+
+test('search result rows play on one click and expose a separate add-only action', () => {
+	const { SearchResultRow } = loadClient();
+	const events = [];
+	const tree = SearchResultRow({
+		item: { id: 1, name: '晴天', artists: [{ name: '周杰伦' }] },
+		onPlay(item) { events.push(`play:${item.id}`); },
+		onAdd(item) { events.push(`add:${item.id}`); }
+	});
+	assert.equal(tree.props.title, '单击播放 晴天');
+	tree.props.onClick();
+	const add = findNodes(tree, (node) => node.type === 'button' && node.props?.['aria-label'] === '仅加入播放列表：晴天')[0];
+	assert.ok(add);
+	add.props.onClick({ stopPropagation() { events.push('stop'); } });
+	assert.deepEqual(events, ['play:1', 'stop', 'add:1']);
+});
+
+test('artist text normalizes strings and structured values without leaking object coercion', () => {
+	const { artistText } = loadClient();
+	assert.equal(artistText('周杰伦'), '周杰伦');
+	assert.equal(artistText([{ name: '卢冠廷' }, { name: 'AGA' }]), '卢冠廷 / AGA');
+	assert.equal(artistText(['卢冠廷', 'AGA']), '卢冠廷 / AGA');
+	assert.equal(artistText('[Object Object]'), '未知歌手');
 });
 
 test('queue list preserves original indices while virtualizing long queues', () => {
@@ -387,9 +414,13 @@ test('search rows add by their catalog song id', () => {
 });
 
 test('an empty strict search surfaces the server guidance instead of looking broken', () => {
-	const { searchFeedbackForResponse } = loadClient();
+	const { SearchFeedbackPanel, searchFeedbackForResponse } = loadClient();
 	assert.equal(searchFeedbackForResponse({ ok: true, items: [], guidance: '没有找到可靠原唱。' }), '没有找到可靠原唱。');
 	assert.equal(searchFeedbackForResponse({ ok: true, items: [{ id: 1 }] }), null);
+	const panel = SearchFeedbackPanel({ message: '没有找到可靠原唱。' });
+	assert.equal(panel.props.className, 'dsa-search-feedback');
+	assert.equal(panel.props.children, '没有找到可靠原唱。');
+	assert.equal(findNodes(panel, (node) => node.type === 'button').length, 0, 'feedback clears through the next/closed search, not a dedicated close button');
 });
 
 test('resolver falls back to Classic, idle, and a blank face', () => {
@@ -517,7 +548,7 @@ function findNodes(root, predicate) {
 	return found;
 }
 
-function loadMusicPlayerHarness({ storedId = null, storageUnavailable = false, ambientPixels = null, apiUp = true } = {}) {
+function loadMusicPlayerHarness({ storedId = null, storageUnavailable = false, ambientPixels = null, apiUp = true, playerStateOverride = {}, fetchImpl = null, onboardingSeen = false } = {}) {
 	let definition;
 	let mountedPlayer;
 	let tree;
@@ -529,7 +560,10 @@ function loadMusicPlayerHarness({ storedId = null, storageUnavailable = false, a
 	const footerHooks = [];
 	const listeners = {};
 	const registrations = [];
-	const values = new Map(storedId ? [['dsh-moony-singer:pet-id:v1', storedId]] : []);
+	const values = new Map([
+		...(storedId ? [['dsh-moony-singer:pet-id:v1', storedId]] : []),
+		...(onboardingSeen ? [['dsh-moony-singer:onboarding:v1', 'seen']] : [])
+	]);
 	const storage = {
 		getItem(key) { return values.get(key) ?? null; },
 		setItem(key, value) { values.set(key, value); }
@@ -537,7 +571,9 @@ function loadMusicPlayerHarness({ storedId = null, storageUnavailable = false, a
 	const playerState = {
 		agentStatus: 'review',
 		musicApiUp: apiUp,
-		playing: { isPlaying: true, song: { id: 'song-1', name: 'Paper Moon', artists: 'Ella', albumPic: 'https://img.test/moon.jpg' } }
+		playing: { isPlaying: true, song: { id: 'song-1', name: 'Paper Moon', artists: 'Ella', albumPic: 'https://img.test/moon.jpg' } },
+		recommendation: { ready: true, count: 60, generating: false },
+		...playerStateOverride
 	};
 	const rerender = function () {
 		activeHooks = musicHooks;
@@ -601,7 +637,10 @@ function loadMusicPlayerHarness({ storedId = null, storageUnavailable = false, a
 	}
 	const sandbox = {
 		clearInterval() {}, clearTimeout() {}, document, Image: TestImage,
-		fetch() { throw new Error('effects stay inactive in MusicPlayer integration tests'); },
+		fetch(path, options) {
+			if (fetchImpl) return fetchImpl(path, options);
+			throw new Error('effects stay inactive in MusicPlayer integration tests');
+		},
 		setInterval() { return 1; }, setTimeout() { return 1; },
 		window: {
 			__ModuleLoader__: { load(value) { definition = value; } },
@@ -648,6 +687,46 @@ function loadMusicPlayerHarness({ storedId = null, storageUnavailable = false, a
 	};
 	return { client, footerToggle, listeners, renderPickers, runAlbumColorEffect, storage, tree: () => tree };
 }
+
+test('recommendation remains actionable while the background pool is preparing', async () => {
+	const requests = [];
+	const harness = loadMusicPlayerHarness({
+		playerStateOverride: {
+			recommendation: { ready: false, count: 0, generating: true },
+			queue: { count: 0, index: -1, revision: 1 }
+		},
+		fetchImpl(path, options) {
+			requests.push({ path, body: JSON.parse(options.body) });
+			return Promise.resolve({ json: async () => ({ ok: false, preparing: true, guidance: '推荐正在准备中' }) });
+		}
+	});
+	findNodes(harness.tree(), (node) => node.type === harness.client.MoonyPet)[0].props.onClick({ stopPropagation() {} });
+	const recommend = findNodes(harness.tree(), (node) => node.type === 'button' && node.props?.children === '推荐')[0];
+	assert.equal(recommend.props.disabled, false);
+	recommend.props.onClick();
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(requests[0].path, '/dsh-alger/recommend');
+	assert.ok(findNodes(harness.tree(), (node) => node.props?.className === 'dsa-queue').length, 'the queue opens immediately while preparation continues');
+});
+
+test('first use shows one lightweight Moony hint and stored acknowledgement suppresses it', () => {
+	const first = loadMusicPlayerHarness();
+	const hint = findNodes(first.tree(), (node) => node.props?.className === 'dsa-first-use-tip')[0];
+	assert.ok(hint);
+	assert.equal(hint.props.children, '可拖拽移动 · 点击月宝展开播放器');
+	assert.equal(findNodes(hint, (node) => node.type === 'button').length, 0);
+
+	const returning = loadMusicPlayerHarness({ onboardingSeen: true });
+	assert.equal(findNodes(returning.tree(), (node) => node.props?.className === 'dsa-first-use-tip').length, 0);
+});
+
+test('expanded player uses the accepted wider readable layout', () => {
+	const { PLAYER_WIDTH, PLAYER_CSS } = loadClient();
+	assert.equal(PLAYER_WIDTH, 304);
+	assert.match(PLAYER_CSS, /\.dsa-qitem\{[^}]*font-size:11\.5px/);
+	assert.match(PLAYER_CSS, /\.dsa-favorite-row \.s\{[^}]*font-size:10px/);
+});
 
 test('MusicPlayer preserves the selected Moony through the collapsed and expanded player flows', () => {
 	const harness = loadMusicPlayerHarness({ storedId: 'drift' });

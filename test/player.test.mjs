@@ -65,6 +65,17 @@ test('canonical recommendation tracks are converted back to player song shape', 
 	assert.equal(queued.trackKey, canonical.trackKey);
 });
 
+test('player snapshots normalize string and object artist entries at the client boundary', () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 9, name: '一生所爱', artists: ['卢冠廷', { name: 'AGA' }] }]);
+	assert.equal(player.queueView().items[0].artists, '卢冠廷 / AGA');
+	assert.equal(player.snapshot().playing.artists, '卢冠廷 / AGA');
+	assert.deepEqual(player.snapshot().playing.artistList, [
+		{ id: null, name: '卢冠廷' },
+		{ id: undefined, name: 'AGA' }
+	]);
+});
+
 test('recommendation starts its first verified track when nothing is active', () => {
 	const player = createPlayer({ file: null });
 	player.insertRecommendationAfterCurrent([song(7, '第一首推荐'), song(8, '第二首推荐')], 'session-empty');
