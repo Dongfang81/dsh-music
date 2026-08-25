@@ -106,6 +106,55 @@ window.__ModuleLoader__.load({
 		function shouldReloadCollection(cachedRevision, remoteRevision, open) {
 			return Boolean(open) && remoteRevision !== undefined && remoteRevision !== null && cachedRevision !== remoteRevision;
 		}
+
+		function createPlaybackReporter(options) {
+			var read = options.read;
+			var send = options.send;
+			var intervalMs = options.intervalMs || 5000;
+			var setTimer = options.setTimer || setTimeout;
+			var clearTimer = options.clearTimer || clearTimeout;
+			var playing = false;
+			var timer = null;
+			var inFlight = null;
+			var pending = false;
+			var disposed = false;
+
+			function clearSchedule() {
+				if (timer !== null) { clearTimer(timer); timer = null; }
+			}
+			function schedule() {
+				if (disposed || !playing || timer !== null || inFlight) return;
+				timer = setTimer(function () { timer = null; transmit(); }, intervalMs);
+			}
+			function transmit() {
+				if (disposed) return Promise.resolve(false);
+				clearSchedule();
+				if (inFlight) { pending = true; return inFlight; }
+				inFlight = Promise.resolve()
+					.then(function () { return send(read()); })
+					.then(function () { return true; }, function () { return false; })
+					.finally(function () {
+						inFlight = null;
+						if (disposed) return;
+						if (pending) { pending = false; transmit(); }
+						else schedule();
+					});
+				return inFlight;
+			}
+			function setPlaying(value) {
+				var next = Boolean(value);
+				if (next === playing) return inFlight || Promise.resolve(false);
+				playing = next;
+				return transmit();
+			}
+			function dispose() {
+				disposed = true;
+				playing = false;
+				pending = false;
+				clearSchedule();
+			}
+			return { setPlaying: setPlaying, checkpoint: transmit, dispose: dispose };
+		}
 		/** 展开宽度。 */
 		var WIDTH = 280;
 		/** 本地存储键。 */
@@ -1249,6 +1298,7 @@ window.__ModuleLoader__.load({
 			// 服务端状态机是唯一事实来源：轮询发现 currentUrl 变化就切换播放；
 			// 音频事件（进度/结束/播放状态）定时上报回服务端。
 			var audioRef = React.useRef(null);
+			var playbackReporterRef = React.useRef(null);
 			var lastUrlRef = React.useRef(null); // 已加载的直链，避免重复播放
 			var lastSongIdRef = React.useRef(null); // 已识别的歌曲（听歌记忆重播检测）
 			var saidSongRef = React.useRef(null); // 已开口说过的歌曲（每首只说一次）
@@ -1261,16 +1311,32 @@ window.__ModuleLoader__.load({
 				var audio = document.createElement("audio");
 				audio.style.display = "none";
 				document.body.appendChild(audio);
+				var reporter = createPlaybackReporter({
+					intervalMs: 5000,
+					read: function () {
+						return {
+							position: audio.currentTime || 0,
+							duration: audio.duration || 0,
+							playing: !audio.paused && !audio.ended,
+							ready: true
+						};
+					},
+					send: reportPlayback
+				});
+				playbackReporterRef.current = reporter;
 				var syncProg = function () {
 					if (seekingRef.current) return;
 					setProg({ pos: audio.currentTime || 0, dur: audio.duration || 0 });
 				};
 				audio.addEventListener("timeupdate", syncProg);
 				audio.addEventListener("durationchange", syncProg);
-				audio.addEventListener("loadedmetadata", syncProg);
+				audio.addEventListener("loadedmetadata", function () { syncProg(); reporter.checkpoint(); });
+				audio.addEventListener("play", function () { reporter.setPlaying(true); });
+				audio.addEventListener("pause", function () { reporter.setPlaying(false); });
+				audio.addEventListener("seeked", function () { reporter.checkpoint(); });
 				audio.addEventListener("ended", function () {
 					// 自然结束：按播放模式处理（单曲循环本地重播；列表循环/随机交给服务端 next）
-					reportPlayback({ playing: false, position: 0, duration: audio.duration || 0, ready: true });
+					reporter.setPlaying(false);
 					var mode = stateRef.current && typeof stateRef.current.playMode === "number" ? stateRef.current.playMode : 0;
 					if (mode === 1) {
 						try { audio.currentTime = 0; var rp = audio.play(); if (rp && typeof rp.catch === "function") rp.catch(function () {}); } catch { /* ignore */ }
@@ -1279,7 +1345,7 @@ window.__ModuleLoader__.load({
 					command("next").then(function () { setTimeout(refresh, 300); }).catch(function () {});
 				});
 				audio.addEventListener("error", function () {
-					reportPlayback({ playing: false, position: 0, duration: audio.duration || 0, ready: true });
+					reporter.setPlaying(false);
 				});
 				var unbindBuffering = bindAudioBuffering(audio, setBuffering);
 				audioRef.current = audio;
@@ -1291,6 +1357,8 @@ window.__ModuleLoader__.load({
 					analyzerTimerRef.current = null;
 					analyzerRef.current = null;
 					unbindBuffering();
+					reporter.dispose();
+					if (playbackReporterRef.current === reporter) playbackReporterRef.current = null;
 					try { audio.pause(); audio.src = ""; } catch { /* ignore */ }
 					if (audio.parentNode) audio.parentNode.removeChild(audio);
 					audioRef.current = null;
@@ -1445,29 +1513,6 @@ window.__ModuleLoader__.load({
 					lastSongIdRef.current = null;
 				}
 			}, [state]);
-
-			// 进度上报（2s 一次，供服务端状态/模型读取）
-			React.useEffect(function () {
-				var timer = setInterval(function () {
-					var audio = audioRef.current;
-					if (!audio) return;
-					reportPlayback({
-						position: audio.currentTime || 0,
-						duration: audio.duration || 0,
-						playing: !audio.paused && !audio.ended,
-						ready: true
-					});
-				}, 2000);
-				return function () { clearInterval(timer); };
-			}, []);
-
-			// 听歌记忆：深夜提醒轮询（服务端判定并设置宠物通知，客户端 60s 问一次）
-			React.useEffect(function () {
-				var timer = setInterval(function () {
-					post("/dsh-alger/habits", { action: "night" }).catch(function () {});
-				}, 60000);
-				return function () { clearInterval(timer); };
-			}, []);
 
 			// 恢复位置 / 默认右下角
 			React.useEffect(function () {
@@ -2330,6 +2375,7 @@ window.__ModuleLoader__.load({
 		exports.fetchJsonWithTimeout = fetchJsonWithTimeout;
 		exports.compactStateSignature = compactStateSignature;
 		exports.shouldReloadCollection = shouldReloadCollection;
+		exports.createPlaybackReporter = createPlaybackReporter;
 		exports.parseLrc = parseLrc;
 		exports.karaokeProgress = karaokeProgress;
 		exports.syncMediaSession = syncMediaSession;

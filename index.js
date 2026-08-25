@@ -499,6 +499,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		/** 播放进度上报（浮动窗口 <audio> 定时上报） */
 		async playback(args) {
 			const value = asRecord(args);
+			const activePlayback = Boolean(value.playing) && Boolean(player.state.playing);
 			player.reportPlayback({
 				position: Number(value.position) || 0,
 				duration: Number(value.duration) || 0,
@@ -509,7 +510,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			try {
 				const song = player.state.queue[player.state.index] || null;
 				if (song && song.id) {
-					habits.recordPlayback({
+					await habits.recordPlayback({
 						song: {
 							id: song.id,
 							name: song.name,
@@ -518,8 +519,12 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 						},
 						position: Number(value.position) || 0,
 						duration: Number(value.duration) || 0,
-						playing: Boolean(player.state.playing)
-					}).catch(() => {});
+						playing: activePlayback
+					});
+					if (activePlayback && typeof habits.nightCheck === 'function') {
+						const night = await habits.nightCheck();
+						if (night?.remind) shared.setNotice('🌙 夜深了，早点休息～月宝儿先退下啦', 8000);
+					}
 				}
 			} catch {
 				/* 忽略 */

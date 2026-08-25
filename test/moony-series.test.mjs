@@ -144,6 +144,46 @@ test('compact state signatures ignore object identity and collection reloads req
 	assert.equal(shouldReloadCollection(4, 5, true), true);
 });
 
+test('playback reporter sends on transitions and checkpoints only while active', async () => {
+	const { createPlaybackReporter } = loadClient();
+	let active = false;
+	let nextTimer = 0;
+	const timers = new Map();
+	const sent = [];
+	const reporter = createPlaybackReporter({
+		read: () => ({ playing: active, position: sent.length * 5 }),
+		send: async (payload) => { sent.push(payload); },
+		intervalMs: 5000,
+		setTimer(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
+		clearTimer(id) { timers.delete(id); }
+	});
+	active = true;
+	await reporter.setPlaying(true);
+	assert.equal(sent.length, 1);
+	assert.equal(timers.size, 1);
+	assert.equal([...timers.values()][0].delay, 5000);
+	await reporter.setPlaying(true);
+	assert.equal(sent.length, 1, 'repeated play events do not duplicate sends or timers');
+	assert.equal(timers.size, 1);
+
+	const [timerId, timer] = [...timers.entries()][0];
+	timers.delete(timerId);
+	timer.fn();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(sent.length, 2);
+	assert.equal(timers.size, 1, 'a periodic checkpoint schedules its successor after settling');
+	await reporter.checkpoint();
+	assert.equal(sent.length, 3);
+	assert.equal(timers.size, 1);
+
+	active = false;
+	await reporter.setPlaying(false);
+	assert.equal(sent.length, 4, 'pause is reported immediately');
+	assert.equal(timers.size, 0, 'paused playback has no periodic wakeup');
+	reporter.dispose();
+	assert.equal(timers.size, 0);
+});
+
 test('moon phase clamps progress and fades only through the final eight percent', () => {
 	const { resolveMoonPhase } = loadClient();
 	assert.deepEqual(Object.values(resolveMoonPhase(-1)), [0, 1]);

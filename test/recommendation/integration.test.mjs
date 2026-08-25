@@ -234,6 +234,27 @@ test('action-level playback mutations invalidate compact player state', async ()
 	assert.equal(player.revisions().stateRevision, before + 1);
 });
 
+test('active playback records habits before checking night while paused reports skip the check', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	const events = [];
+	const shared = {};
+	const habits = {
+		async recordPlayback() { events.push('record'); },
+		async nightCheck() { events.push('night'); return { remind: true, nightSeconds: 7200 }; }
+	};
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, shared, player, {}, habits
+	);
+	await actions.playback({ position: 5, duration: 200, playing: true, ready: true });
+	assert.deepEqual(events, ['record', 'night']);
+	assert.match(shared.getNotice(), /夜深了/);
+	events.length = 0;
+	await actions.playback({ position: 5, duration: 200, playing: false, ready: true });
+	assert.deepEqual(events, ['record']);
+});
+
 test('strong preference signals schedule refresh while skip and completion only update history', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([
