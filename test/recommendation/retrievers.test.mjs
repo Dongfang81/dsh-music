@@ -60,3 +60,23 @@ test('each factory adapter enforces its own timeout', async () => {
 		signal: new AbortController().signal
 	}), /timed out/);
 });
+
+test('factory adapters pass parent cancellation to the underlying music request', async () => {
+	let requestSignal = null;
+	const client = {
+		search: async (_query, _type, _limit, options) => {
+			requestSignal = options?.signal ?? null;
+			return new Promise((resolve, reject) => requestSignal?.addEventListener('abort', () => reject(requestSignal.reason), { once: true }));
+		}
+	};
+	const [liked] = createRetrievers({ client, localLibrary: null, timeoutMs: 1000 });
+	const controller = new AbortController();
+	const pending = liked({
+		context,
+		profile: { ...profile, tracks: { a: { title: '晴天', artists: ['周杰伦'], affinity: 5 } } },
+		signal: controller.signal
+	});
+	controller.abort(new Error('user cancelled'));
+	await assert.rejects(() => pending, /user cancelled/);
+	assert.equal(requestSignal?.aborted, true);
+});

@@ -19,8 +19,54 @@ window.__ModuleLoader__.load({
 		var ReactDOM = require("react-dom");
 		var h = React.createElement;
 
-		/** 轮询间隔（ms）。 */
-		var POLL_MS = 1500;
+		/** 根据播放器可见性选择轮询间隔，后台与完全隐藏时主动降频。 */
+		function statePollDelay(input) {
+			var value = input || {};
+			if (value.hidden || value.documentHidden) return 15000;
+			return value.collapsed ? 5000 : 1500;
+		}
+
+		/** 单飞状态轮询器：慢请求期间的多个刷新合并成一次跟进请求。 */
+		function createStatePoller(options) {
+			var request = options.request;
+			var getDelay = options.getDelay;
+			var setTimer = options.setTimer || setTimeout;
+			var clearTimer = options.clearTimer || clearTimeout;
+			var timer = null;
+			var running = false;
+			var pending = false;
+			var stopped = true;
+
+			function schedule() {
+				if (stopped) return;
+				timer = setTimer(function () { timer = null; run(); }, getDelay());
+			}
+			async function run() {
+				if (stopped || running) { if (!stopped) pending = true; return; }
+				running = true;
+				try { await request(); } catch { /* 单次状态失败由下一轮恢复 */ }
+				finally {
+					running = false;
+					if (stopped) return;
+					if (pending) { pending = false; run(); }
+					else schedule();
+				}
+			}
+			function refresh() {
+				if (stopped) return false;
+				if (timer !== null) { clearTimer(timer); timer = null; }
+				if (running) { pending = true; return true; }
+				run();
+				return true;
+			}
+			function start() { if (!stopped) return; stopped = false; refresh(); }
+			function stop() {
+				stopped = true;
+				pending = false;
+				if (timer !== null) { clearTimer(timer); timer = null; }
+			}
+			return { start: start, refresh: refresh, stop: stop };
+		}
 		/** 展开宽度。 */
 		var WIDTH = 280;
 		/** 本地存储键。 */
@@ -1099,16 +1145,39 @@ window.__ModuleLoader__.load({
 				noticeTimer.current = setTimeout(function () { setNotice(null); }, 6000);
 			};
 
-			var refresh = React.useCallback(function () {
-				getState().then(function (s) { setState(s); }).catch(function () { /* 忽略瞬时失败 */ });
+			var pollContextRef = React.useRef({ collapsed: collapsed, hidden: hidden });
+			pollContextRef.current = { collapsed: collapsed, hidden: hidden };
+			var statePollerRef = React.useRef(null);
+			var requestState = React.useCallback(function () {
+				return getState().then(function (s) { setState(s); });
 			}, []);
+			var refresh = React.useCallback(function () {
+				if (statePollerRef.current) return statePollerRef.current.refresh();
+				return requestState().catch(function () { /* 忽略瞬时失败 */ });
+			}, [requestState]);
 
-			// 轮询
+			// 单飞自适应轮询：展开态及时，收起/隐藏/后台态降频；可见性变化立即同步一次。
 			React.useEffect(function () {
-				refresh();
-				var timer = setInterval(refresh, POLL_MS);
-				return function () { clearInterval(timer); };
-			}, [refresh]);
+				var poller = createStatePoller({
+					request: requestState,
+					getDelay: function () {
+						return statePollDelay({
+							collapsed: pollContextRef.current.collapsed,
+							hidden: pollContextRef.current.hidden,
+							documentHidden: typeof document !== "undefined" && Boolean(document.hidden)
+						});
+					}
+				});
+				statePollerRef.current = poller;
+				var onVisibility = function () { poller.refresh(); };
+				if (typeof document !== "undefined" && document.addEventListener) document.addEventListener("visibilitychange", onVisibility);
+				poller.start();
+				return function () {
+					if (typeof document !== "undefined" && document.removeEventListener) document.removeEventListener("visibilitychange", onVisibility);
+					poller.stop();
+					if (statePollerRef.current === poller) statePollerRef.current = null;
+				};
+			}, [requestState]);
 
 			// ---------- 内置 <audio> 播放引擎 ----------
 			// 服务端状态机是唯一事实来源：轮询发现 currentUrl 变化就切换播放；
@@ -1348,18 +1417,25 @@ window.__ModuleLoader__.load({
 				setPos(null);
 			}, []);
 
-			// 视口内钳制（仅展开态生效：收起态宠物锚点不受展开卡尺寸影响，否则会被每轮轮询往左拽）
+			// 视口内钳制仅响应真实布局变化，不再随每轮服务端状态刷新读取布局。
 			React.useEffect(function () {
 				if (collapsed) return;
-				var height = cardRef.current ? cardRef.current.offsetHeight : 260;
-				var p = posRef.current;
-				if (!p) return;
-				var clamped = {
-					x: Math.max(4, Math.min(window.innerWidth - WIDTH - 4, p.x)),
-					y: Math.max(4, Math.min(window.innerHeight - height - 4, p.y))
+				var clamp = function () {
+					var height = cardRef.current ? cardRef.current.offsetHeight : 260;
+					var p = posRef.current;
+					if (!p) return;
+					var clamped = {
+						x: Math.max(4, Math.min(window.innerWidth - WIDTH - 4, p.x)),
+						y: Math.max(4, Math.min(window.innerHeight - height - 4, p.y))
+					};
+					if (clamped.x !== p.x || clamped.y !== p.y) { posRef.current = clamped; setPos(clamped); }
 				};
-				if (clamped.x !== p.x || clamped.y !== p.y) { posRef.current = clamped; setPos(clamped); }
-			}, [collapsed, state]);
+				clamp();
+				window.addEventListener("resize", clamp);
+				var observer = typeof ResizeObserver !== "undefined" && cardRef.current ? new ResizeObserver(clamp) : null;
+				if (observer) observer.observe(cardRef.current);
+				return function () { window.removeEventListener("resize", clamp); if (observer) observer.disconnect(); };
+			}, [collapsed]);
 
 			// 拖动
 			var onDragStart = function (event) {
@@ -2177,6 +2253,8 @@ window.__ModuleLoader__.load({
 		exports.apply = apply;
 		exports.inject = inject;
 		exports.name = "@dongfang81/dsh-music";
+		exports.statePollDelay = statePollDelay;
+		exports.createStatePoller = createStatePoller;
 		exports.parseLrc = parseLrc;
 		exports.karaokeProgress = karaokeProgress;
 		exports.syncMediaSession = syncMediaSession;

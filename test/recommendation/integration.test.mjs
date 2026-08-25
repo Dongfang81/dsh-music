@@ -133,7 +133,10 @@ test('status exposes recommendation pool readiness without starting generation',
 		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
 		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} },
 		{
-			pool: { snapshot: async () => ({ ready: true, count: 60, items: Array(60) }) },
+			pool: {
+				status: async () => ({ ready: true, count: 60 }),
+				snapshot: async () => { throw new Error('full pool snapshot must not run during status polling'); }
+			},
 			scheduler: { status: () => ({ state: 'idle', generating: false, scheduled: false, lastError: null }) },
 			coordinator: { recommend: async () => { generationCalls += 1; } }
 		}

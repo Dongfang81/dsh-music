@@ -233,7 +233,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		async status() {
 			const [musicApiUp, poolState] = await Promise.all([
 				apiUp(),
-				pool ? pool.snapshot().catch(() => null) : Promise.resolve(null)
+				pool ? pool.status().catch(() => null) : Promise.resolve(null)
 			]);
 			const schedulerState = scheduler?.status?.() ?? null;
 			const snap = player.snapshot();
@@ -279,7 +279,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			if (!pool) return { ok: false, preparing: true, guidance: '推荐池尚未初始化，请稍后再试。' };
 			const consumed = await pool.consume(30);
 			if (!consumed.ok) {
-				scheduler?.schedule('cold-start');
+				scheduler?.schedule('cold-start', { urgent: true });
 				return { ok: false, preparing: true, count: 0, remaining: consumed.remaining, guidance: '推荐正在准备中，请稍后再试。' };
 			}
 			try {
@@ -295,7 +295,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				await pool.restore(consumed.transaction).catch(() => {});
 				throw error;
 			}
-			if (consumed.remaining <= 30) scheduler?.schedule('low-watermark');
+			if (consumed.remaining <= 30) scheduler?.schedule('low-watermark', { urgent: true });
 			return {
 				ok: true,
 				insertMode: 'after-current-and-play',
@@ -1490,10 +1490,10 @@ export function apply(ctx, config) {
 					confidence: 1
 				} : null;
 			} : null,
-			direct: async (track) => {
+			direct: async (track, options = {}) => {
 				const id = Number(track?.raw?.id);
 				if (!id) return null;
-				const url = await client.songUrl(id, 'higher');
+				const url = await client.songUrl(id, 'higher', { signal: options.signal });
 				return url ? { url, sourceKey: 'netease', confidence: 1, expiresAt: Date.now() + 4 * 60 * 1000 } : null;
 			},
 		});
@@ -1530,7 +1530,7 @@ export function apply(ctx, config) {
 				targetSize: 60
 			});
 			recommendationScheduler = createRecommendationScheduler({
-				debounceMs: 2000,
+				debounceMs: 10000,
 				retryDelayMs: 30000,
 				generate: async (input) => {
 					const result = await recommendationGenerator.generate(input);
@@ -1539,10 +1539,10 @@ export function apply(ctx, config) {
 				}
 			});
 			recommendationPool.load().then(() => {
-				if (recommendationPool.needsRefill()) recommendationScheduler.schedule('startup');
+				if (recommendationPool.needsRefill()) recommendationScheduler.schedule('startup', { urgent: true });
 			}).catch((error) => {
 				console.warn('[dsh-moony-singer] 推荐池加载失败: ' + ((error && error.message) || String(error)));
-				recommendationScheduler.schedule('startup-recovery');
+				recommendationScheduler.schedule('startup-recovery', { urgent: true });
 			});
 		}
 	} catch (error) {
@@ -1614,8 +1614,8 @@ export function apply(ctx, config) {
 		const now = Date.now();
 		let best = 'idle';
 		let bestT = -Infinity;
-		for (const e of agentState.values()) {
-			if (now - e.lastActivity > 60000) continue;
+		for (const [sid, e] of agentState) {
+			if (now - e.lastActivity > 60000) { agentState.delete(sid); continue; }
 			if (e.lastActivity > bestT) {
 				bestT = e.lastActivity;
 				best = e.status;
@@ -1643,6 +1643,7 @@ export function apply(ctx, config) {
 		ctx.on('dispose', () => {
 			coordinator?.cancel('plugin disposed');
 			recommendationScheduler?.dispose();
+			habits.flush().catch(() => {});
 			for (const dispose of disposers) dispose();
 			if (apiHandle && apiHandle.handle) {
 				stopApiServer(apiHandle.handle).catch(() => {});

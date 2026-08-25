@@ -19,6 +19,27 @@ test('coalesces consecutive triggers into one background generation', async () =
 	assert.equal(scheduler.status().state, 'idle');
 });
 
+test('urgent refill bypasses the quiet debounce and absorbs pending preference reasons', async () => {
+	const timers = [];
+	const cleared = [];
+	const calls = [];
+	const scheduler = createRecommendationScheduler({
+		debounceMs: 10000,
+		setTimeoutFn(fn, delay) { timers.push({ fn, delay }); return timers.length; },
+		clearTimeoutFn(id) { cleared.push(id); },
+		generate: async ({ reasons }) => calls.push(reasons)
+	});
+	scheduler.schedule('favorite');
+	scheduler.schedule('unfavorite');
+	assert.equal(calls.length, 0);
+	assert.equal(timers.at(-1).delay, 10000);
+	scheduler.schedule('low-watermark', { urgent: true });
+	await tick();
+	assert.equal(calls.length, 1);
+	assert.deepEqual(new Set(calls[0]), new Set(['favorite', 'unfavorite', 'low-watermark']));
+	assert.ok(cleared.length >= 1);
+});
+
 test('runs only one follow-up generation when triggers arrive during active work', async () => {
 	let releaseFirst;
 	const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
@@ -85,4 +106,20 @@ test('dispose cancels queued work and rejects new scheduling', async () => {
 	assert.equal(calls, 0);
 	assert.equal(scheduler.schedule('search-play'), false);
 	assert.equal(scheduler.status().state, 'disposed');
+});
+
+test('dispose aborts the signal of a running generation', async () => {
+	let aborted = false;
+	const scheduler = createRecommendationScheduler({
+		debounceMs: 0,
+		generate: ({ signal }) => new Promise((resolve) => {
+			signal?.addEventListener('abort', () => { aborted = true; resolve(); }, { once: true });
+			setTimeout(resolve, 20);
+		})
+	});
+	scheduler.startNow('startup');
+	await tick();
+	scheduler.dispose();
+	await tick();
+	assert.equal(aborted, true);
 });

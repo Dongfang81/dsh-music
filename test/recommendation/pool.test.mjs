@@ -40,6 +40,22 @@ test('consumes 30 tracks from 60 and commits bounded recent history', async () =
 	assert.equal(pool.needsRefill(), true);
 });
 
+test('status exposes pool metadata without cloning or returning track items', async () => {
+	const { pool } = await fixture();
+	await pool.replace(tracks(60), { generationId: 'metadata-only', profileRevision: 42 });
+	const status = await pool.status();
+	assert.deepEqual(status, {
+		ready: true,
+		count: 60,
+		generationId: 'metadata-only',
+		generatedAt: status.generatedAt,
+		profileRevision: 42,
+		pending: false,
+		lastGenerationStatus: { ok: true, count: 60 }
+	});
+	assert.equal(Object.hasOwn(status, 'items'), false);
+});
+
 test('restores a consumed batch when queue insertion fails', async () => {
 	const { pool } = await fixture();
 	await pool.replace(tracks(60), { generationId: 'g1' });

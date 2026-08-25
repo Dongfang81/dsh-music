@@ -138,3 +138,30 @@ test('returns an honest failure and keeps the pool when candidate collection fai
 	assert.match(result.error, /catalog offline/);
 	assert.equal((await pool.snapshot()).generationId, 'old');
 });
+
+test('generation passes cancellation through candidate collection and stops cleanly', async () => {
+	const dir = await mkdtemp(join(tmpdir(), 'moony-cancel-generator-'));
+	const pool = createRecommendationPool({ file: join(dir, 'pool.json') });
+	let receivedSignal = null;
+	const generator = createRecommendationGenerator({
+		pool,
+		player: { current: () => null, state: { queue: [] } },
+		profile: { snapshot: async () => ({ tracks: {}, artists: {}, rules: [], resolverStats: {} }) },
+		collectCandidates: async ({ signal }) => {
+			receivedSignal = signal;
+			return new Promise((resolve, reject) => {
+				signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+				setTimeout(() => reject(new Error('cancellation did not reach collector')), 20);
+			});
+		},
+		resolver: { resolve: async () => null }
+	});
+	const controller = new AbortController();
+	const pending = generator.generate({ reasons: ['favorite'], signal: controller.signal });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	controller.abort(new Error('generation cancelled'));
+	const result = await pending;
+	assert.equal(receivedSignal, controller.signal);
+	assert.equal(result.ok, false);
+	assert.match(result.error, /generation cancelled/);
+});

@@ -75,6 +75,37 @@ test('catalog contains the first wave and the three retained listening-style cha
 	}
 });
 
+test('state polling slows down when collapsed, hidden, or in a background tab', () => {
+	const { statePollDelay } = loadClient();
+	assert.equal(statePollDelay({ collapsed: false, hidden: false, documentHidden: false }), 1500);
+	assert.equal(statePollDelay({ collapsed: true, hidden: false, documentHidden: false }), 5000);
+	assert.equal(statePollDelay({ collapsed: false, hidden: true, documentHidden: false }), 15000);
+	assert.equal(statePollDelay({ collapsed: false, hidden: false, documentHidden: true }), 15000);
+});
+
+test('state poller coalesces refreshes while one request is in flight', async () => {
+	const { createStatePoller } = loadClient();
+	const timers = [];
+	const requests = [];
+	const poller = createStatePoller({
+		request() { return new Promise((resolve) => requests.push(resolve)); },
+		getDelay() { return 5000; },
+		setTimer(fn, delay) { timers.push({ fn, delay }); return timers.length; },
+		clearTimer() {}
+	});
+	poller.start();
+	poller.refresh();
+	poller.refresh();
+	assert.equal(requests.length, 1);
+	requests.shift()();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(requests.length, 1, 'multiple pending refreshes become one follow-up request');
+	requests.shift()();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(timers.at(-1).delay, 5000);
+	poller.stop();
+});
+
 test('moon phase clamps progress and fades only through the final eight percent', () => {
 	const { resolveMoonPhase } = loadClient();
 	assert.deepEqual(Object.values(resolveMoonPhase(-1)), [0, 1]);
