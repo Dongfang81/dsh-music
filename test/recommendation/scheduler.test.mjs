@@ -5,6 +5,62 @@ import { createRecommendationScheduler } from '../../lib/recommendation/schedule
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
 
+test('whenIdle keeps an explicitly awaited unrefed debounce alive', async () => {
+	let callback;
+	let refCalls = 0;
+	let unrefCalls = 0;
+	const timerHandle = {
+		ref() { refCalls += 1; },
+		unref() { unrefCalls += 1; }
+	};
+	const scheduler = createRecommendationScheduler({
+		debounceMs: 10,
+		setTimeoutFn(fn) { callback = fn; return timerHandle; },
+		clearTimeoutFn() {},
+		generate: async () => {}
+	});
+
+	scheduler.schedule('favorite');
+	assert.equal(unrefCalls, 1, 'background debounce does not keep DSH alive');
+	const idle = scheduler.whenIdle();
+	assert.equal(refCalls, 1, 'an explicit waiter keeps the pending debounce alive');
+	callback();
+	await idle;
+	assert.equal(scheduler.status().state, 'idle');
+});
+
+test('a retry timer created after whenIdle inherits the active waiter', async () => {
+	let retryCallback;
+	let markRetryTimer;
+	const retryTimerCreated = new Promise((resolve) => { markRetryTimer = resolve; });
+	let refCalls = 0;
+	let unrefCalls = 0;
+	let attempts = 0;
+	const scheduler = createRecommendationScheduler({
+		retryDelayMs: 10,
+		setTimeoutFn(fn) {
+			retryCallback = fn;
+			markRetryTimer();
+			return { ref() { refCalls += 1; }, unref() { unrefCalls += 1; } };
+		},
+		clearTimeoutFn() {},
+		generate: async () => {
+			attempts += 1;
+			if (attempts === 1) throw new Error('temporary failure');
+		}
+	});
+
+	scheduler.startNow('low-watermark');
+	const idle = scheduler.whenIdle();
+	await retryTimerCreated;
+	assert.equal(typeof retryCallback, 'function');
+	assert.equal(refCalls, 1, 'the future retry stays alive for the existing waiter');
+	assert.equal(unrefCalls, 0);
+	retryCallback();
+	await idle;
+	assert.equal(attempts, 2);
+});
+
 test('coalesces consecutive triggers into one background generation', async () => {
 	const calls = [];
 	const scheduler = createRecommendationScheduler({

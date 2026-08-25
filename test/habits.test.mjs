@@ -221,6 +221,8 @@ test('playing progress batches disk persistence until its configured save window
 test('progress received during an active write remains dirty for the next flush', async () => {
 	const file = join(tmpdir(), 'moony-habits-concurrent-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.json');
 	let releaseWrite;
+	let markWriteStarted;
+	const writeStarted = new Promise((resolve) => { markWriteStarted = resolve; });
 	let writes = 0;
 	const habits = createHabits({
 		file,
@@ -230,6 +232,7 @@ test('progress received during an active write remains dirty for the next flush'
 			mkdir: realMkdir,
 			async writeFile(path, value) {
 				writes += 1;
+				markWriteStarted();
 				if (writes === 1) await new Promise((resolve) => { releaseWrite = resolve; });
 				return realWriteFile(path, value);
 			}
@@ -237,7 +240,7 @@ test('progress received during an active write remains dirty for the next flush'
 	});
 	await habits.recordPlayback({ song: song(1), position: 0, duration: 300, playing: true });
 	const firstFlush = habits.flush();
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	await writeStarted;
 	assert.equal(writes, 1);
 	await habits.recordPlayback({ song: song(1), position: 2, duration: 300, playing: true });
 	releaseWrite();
