@@ -106,6 +106,44 @@ test('state poller coalesces refreshes while one request is in flight', async ()
 	poller.stop();
 });
 
+test('state fetch timeout aborts a hung request so polling can recover', async () => {
+	const { fetchJsonWithTimeout } = loadClient();
+	const timers = [];
+	const cleared = [];
+	const pending = fetchJsonWithTimeout('/dsh-alger/state', { timeoutMs: 5000 }, {
+		AbortController,
+		fetch(_path, options) {
+			return new Promise((_resolve, reject) => {
+				options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+			});
+		},
+		setTimer(fn, delay) { timers.push({ fn, delay }); return timers.length; },
+		clearTimer(id) { cleared.push(id); }
+	});
+	assert.equal(timers[0].delay, 5000);
+	timers[0].fn();
+	await assert.rejects(() => pending, /request timeout/);
+	assert.deepEqual(cleared, [1]);
+});
+
+test('compact state signatures ignore object identity and collection reloads require an open stale panel', () => {
+	const { compactStateSignature, shouldReloadCollection } = loadClient();
+	const first = {
+		stateRevision: 3,
+		musicApiUp: true,
+		playing: { song: { id: 1, name: '晴天' }, isPlaying: true },
+		queue: { count: 60, index: 4, revision: 8 },
+		favorites: { count: 2, revision: 5 },
+		recommendation: { ready: true, count: 60, generating: false, lastError: null }
+	};
+	assert.equal(compactStateSignature(first), compactStateSignature(JSON.parse(JSON.stringify(first))));
+	assert.notEqual(compactStateSignature(first), compactStateSignature({ ...first, queue: { ...first.queue, revision: 9 } }));
+	assert.equal(shouldReloadCollection(null, 4, true), true);
+	assert.equal(shouldReloadCollection(4, 4, true), false);
+	assert.equal(shouldReloadCollection(4, 5, false), false);
+	assert.equal(shouldReloadCollection(4, 5, true), true);
+});
+
 test('moon phase clamps progress and fades only through the final eight percent', () => {
 	const { resolveMoonPhase } = loadClient();
 	assert.deepEqual(Object.values(resolveMoonPhase(-1)), [0, 1]);

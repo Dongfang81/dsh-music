@@ -67,6 +67,45 @@ window.__ModuleLoader__.load({
 			}
 			return { start: start, refresh: refresh, stop: stop };
 		}
+
+		function fetchJsonWithTimeout(path, options, runtime) {
+			var config = options || {};
+			var env = runtime || {};
+			var fetchFn = env.fetch || fetch;
+			var AbortControllerClass = env.AbortController || AbortController;
+			var setTimer = env.setTimer || setTimeout;
+			var clearTimer = env.clearTimer || clearTimeout;
+			var controller = new AbortControllerClass();
+			var timer = setTimer(function () { controller.abort(new Error("request timeout")); }, config.timeoutMs || 5000);
+			var request = Object.assign({}, config.request || {}, { signal: controller.signal });
+			return fetchFn(path, request)
+				.then(function (response) { return response.json(); })
+				.finally(function () { clearTimer(timer); });
+		}
+
+		function compactStateSignature(input) {
+			var state = input || {};
+			var playing = state.playing || {};
+			var song = playing.song || {};
+			var playback = state.playback || {};
+			var queue = state.queue || {};
+			var favorites = state.favorites || {};
+			var recommendation = state.recommendation || {};
+			return JSON.stringify([
+				state.ok, state.musicApiUp, state.stateRevision,
+				song.id, song.name, playing.isPlaying,
+				playback.position, playback.duration, playback.playing,
+				state.favorite, state.favoriteCount, state.playMode, state.volume,
+				state.currentUrl, state.ready, state.notice, state.agentStatus,
+				queue.count, queue.index, queue.revision,
+				favorites.count, favorites.revision,
+				recommendation.ready, recommendation.count, recommendation.generating, recommendation.lastError
+			]);
+		}
+
+		function shouldReloadCollection(cachedRevision, remoteRevision, open) {
+			return Boolean(open) && remoteRevision !== undefined && remoteRevision !== null && cachedRevision !== remoteRevision;
+		}
 		/** 展开宽度。 */
 		var WIDTH = 280;
 		/** 本地存储键。 */
@@ -451,7 +490,10 @@ window.__ModuleLoader__.load({
 
 		/* ---------- API ---------- */
 		function getState() {
-			return fetch("/dsh-alger/state", { cache: "no-store" }).then(function (r) { return r.json(); });
+			return fetchJsonWithTimeout("/dsh-alger/state", { timeoutMs: 5000, request: { cache: "no-store" } });
+		}
+		function getQueueView() {
+			return fetchJsonWithTimeout("/dsh-alger/queue-view", { timeoutMs: 5000, request: { cache: "no-store" } });
 		}
 		function post(path, body) {
 			return fetch(path, {
@@ -1061,6 +1103,7 @@ window.__ModuleLoader__.load({
 		function MusicPlayer() {
 			var [state, setState] = React.useState(null);
 			var stateRef = React.useRef(null); // 供 audio 事件回调读取最新状态（避免闭包过期）
+			var stateSignatureRef = React.useRef(null);
 			stateRef.current = state;
 			var [petId, setPetId] = React.useState(function () { return readStoredMoonyId(getLocalStorage()); });
 			var [autoMatch, setAutoMatch] = React.useState(function () { return readAutoMatch(getLocalStorage()); });
@@ -1114,10 +1157,12 @@ window.__ModuleLoader__.load({
 			var [searching, setSearching] = React.useState(false);
 			var [results, setResults] = React.useState(null);
 			var [queueOpen, setQueueOpen] = React.useState(false);
+			var [queueView, setQueueView] = React.useState(null);
 			var [selectedIdx, setSelectedIdx] = React.useState(null); // 播放列表"单击选中"的行
 			var [favOptimistic, setFavOptimistic] = React.useState(null); // 收藏乐观状态（null=跟随真实状态）
 			var [favoritesOpen, setFavoritesOpen] = React.useState(false);
 			var [favoriteSongs, setFavoriteSongs] = React.useState(null);
+			var [favoriteRevision, setFavoriteRevision] = React.useState(null);
 			var [favoritesLoading, setFavoritesLoading] = React.useState(false);
 			// 关闭/激活与侧边栏开关按钮共享（pub/sub）
 			var [hidden, setHidden] = React.useState(petVis.hidden);
@@ -1149,7 +1194,14 @@ window.__ModuleLoader__.load({
 			pollContextRef.current = { collapsed: collapsed, hidden: hidden };
 			var statePollerRef = React.useRef(null);
 			var requestState = React.useCallback(function () {
-				return getState().then(function (s) { setState(s); });
+				return getState().then(function (s) {
+					var signature = compactStateSignature(s);
+					if (signature !== stateSignatureRef.current) {
+						stateSignatureRef.current = signature;
+						setState(s);
+					}
+					return s;
+				});
 			}, []);
 			var refresh = React.useCallback(function () {
 				if (statePollerRef.current) return statePollerRef.current.refresh();
@@ -1178,6 +1230,20 @@ window.__ModuleLoader__.load({
 					if (statePollerRef.current === poller) statePollerRef.current = null;
 				};
 			}, [requestState]);
+
+			// 播放列表仅在面板打开且 revision 过期时加载完整行数据。
+			React.useEffect(function () {
+				var remoteRevision = state && state.queue ? state.queue.revision : null;
+				var cachedRevision = queueView ? queueView.revision : null;
+				if (!shouldReloadCollection(cachedRevision, remoteRevision, queueOpen)) return;
+				var cancelled = false;
+				getQueueView().then(function (view) {
+					if (!cancelled && view && view.ok !== false) setQueueView(view);
+				}).catch(function (error) {
+					if (!cancelled) flash("err", (error && error.message) || "读取播放列表失败");
+				});
+				return function () { cancelled = true; };
+			}, [queueOpen, state && state.queue && state.queue.revision, queueView && queueView.revision]);
 
 			// ---------- 内置 <audio> 播放引擎 ----------
 			// 服务端状态机是唯一事实来源：轮询发现 currentUrl 变化就切换播放；
@@ -1544,19 +1610,24 @@ window.__ModuleLoader__.load({
 					setFavoritesLoading(false);
 					if (!r || r.ok === false) throw new Error((r && r.error) || "读取收藏失败");
 					setFavoriteSongs(r.songs || []);
+					setFavoriteRevision(r.revision === undefined ? null : r.revision);
 					return r;
 				}).catch(function (error) {
 					setFavoritesLoading(false);
 					throw error;
 				});
 			};
+			React.useEffect(function () {
+				var remoteRevision = state && state.favorites ? state.favorites.revision : null;
+				if (!shouldReloadCollection(favoriteRevision, remoteRevision, favoritesOpen)) return;
+				loadFavorites().catch(function (error) { flash("err", error.message || "读取收藏失败"); });
+			}, [favoritesOpen, favoriteRevision, state && state.favorites && state.favorites.revision]);
 			var toggleFavorites = function () {
 				if (favoritesOpen) { setFavoritesOpen(false); return; }
 				setFavoritesOpen(true);
 				setQueueOpen(false);
 				setResults(null);
 				setSearched(false);
-				loadFavorites().catch(function (error) { flash("err", error.message || "读取收藏失败"); });
 			};
 			// 播放全部或从收藏中的指定歌曲开始；收藏面板保持打开。
 			var playFavoritesFrom = function (index) {
@@ -1575,6 +1646,7 @@ window.__ModuleLoader__.load({
 				removeFavoriteApi(song.id).then(function (r) {
 					if (!r || r.ok === false) throw new Error((r && r.error) || "取消收藏失败");
 					setFavoriteSongs(r.songs || []);
+					setFavoriteRevision(r.revision === undefined ? null : r.revision);
 					setTimeout(refresh, 120);
 				}).catch(function (error) {
 					setFavoriteSongs(previous);
@@ -2165,16 +2237,16 @@ window.__ModuleLoader__.load({
 							onClose: function () { setFavoritesOpen(false); }
 						}) : null,
 						// 播放列表
-						!favoritesOpen && state && state.queue && Array.isArray(state.queue.items)
+						!favoritesOpen && state && state.queue
 							? h("div", { className: "dsa-queue" }, [
 									h("div", { className: "dsa-queue-title", onClick: function () { setQueueOpen(!queueOpen); } }, [
 										h("span", null, "播放列表"),
-										h("span", { className: "cnt" }, "(" + state.queue.items.length + " 首)"),
+										h("span", { className: "cnt" }, "(" + (state.queue.count || 0) + " 首)"),
 										h("span", { className: "fold" }, queueOpen ? "▾" : "▸")
 									]),
 									queueOpen
 									? h("div", { className: "dsa-queue-list" }, [
-											state.queue.items.map(function (item, i) {
+											queueView && Array.isArray(queueView.items) ? queueView.items.map(function (item, i) {
 												return h(QueueSongRow, {
 													key: item.id + "-" + i, item: item, index: i,
 													current: i === state.queue.index,
@@ -2183,11 +2255,11 @@ window.__ModuleLoader__.load({
 													onJump: onQueueJump,
 													onRemove: onQueueRemove
 												});
-											}),
-												h("div", { className: "dsa-qclear-row" }, [
-													h("button", {
-														className: "dsa-qclear",
-														disabled: busy || state.queue.items.length === 0,
+											}) : h("div", { className: "dsa-empty" }, "正在加载播放列表…"),
+											h("div", { className: "dsa-qclear-row" }, [
+												h("button", {
+													className: "dsa-qclear",
+													disabled: busy || (state.queue.count || 0) === 0,
 														onClick: onQueueClear
 													}, "清空播放列表")
 												])
@@ -2255,6 +2327,9 @@ window.__ModuleLoader__.load({
 		exports.name = "@dongfang81/dsh-music";
 		exports.statePollDelay = statePollDelay;
 		exports.createStatePoller = createStatePoller;
+		exports.fetchJsonWithTimeout = fetchJsonWithTimeout;
+		exports.compactStateSignature = compactStateSignature;
+		exports.shouldReloadCollection = shouldReloadCollection;
 		exports.parseLrc = parseLrc;
 		exports.karaokeProgress = karaokeProgress;
 		exports.syncMediaSession = syncMediaSession;

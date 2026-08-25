@@ -278,6 +278,21 @@ test('favorites route lists songs and removes one favorite without touching play
 	assert.deepEqual(removeRes.body, { ok: true, removedId: 1, count: 0, songs: [] });
 });
 
+test('favorite list responses carry the revision that invalidates an open panel', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	player.toggleFavorite();
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: true },
+		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} }
+	);
+	const listed = await actions.favoritesList();
+	assert.equal(listed.revision, player.revisions().favoritesRevision);
+	const removed = await actions.favoritesRemove({ songId: 1 });
+	assert.equal(removed.revision, player.revisions().favoritesRevision);
+	assert.ok(removed.revision > listed.revision);
+});
+
 test('favorite removal action updates only favorites and schedules preference refresh', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([

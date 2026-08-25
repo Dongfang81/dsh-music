@@ -415,7 +415,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		/** 浏览器收藏面板：只暴露一个扁平收藏列表，不承担目录或整理功能。 */
 		async favoritesList() {
 			const songs = player.state.favorites.map(compactSong);
-			return { ok: true, count: songs.length, songs };
+			return { ok: true, revision: player.revisions().favoritesRevision, count: songs.length, songs };
 		},
 
 		/** 从扁平收藏列表取消一首收藏，不影响当前播放上下文。 */
@@ -425,7 +425,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const result = player.removeFavorite(songId);
 			if (result.removed) await feedback('unfavorite', result.removed);
 			const songs = player.state.favorites.map(compactSong);
-			return { ok: true, removedId: result.removed ? Number(result.removed.id) : null, count: songs.length, songs };
+			return { ok: true, revision: player.revisions().favoritesRevision, removedId: result.removed ? Number(result.removed.id) : null, count: songs.length, songs };
 		},
 
 		/** alger_song */
