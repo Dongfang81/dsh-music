@@ -155,6 +155,54 @@ window.__ModuleLoader__.load({
 			}
 			return { setPlaying: setPlaying, checkpoint: transmit, dispose: dispose };
 		}
+
+		function createAnalyzerLifecycle(options) {
+			var intervalMs = options.intervalMs || 800;
+			var setTimer = options.setTimer || setTimeout;
+			var clearTimer = options.clearTimer || clearTimeout;
+			var active = false;
+			var disposed = false;
+			var timer = null;
+
+			function clearSchedule() {
+				if (timer !== null) { clearTimer(timer); timer = null; }
+			}
+			function schedule() {
+				if (!active || disposed || timer !== null) return;
+				timer = setTimer(function () {
+					timer = null;
+					if (!active || disposed) return;
+					var value = options.sample();
+					if (value) options.onSample(value);
+					schedule();
+				}, intervalMs);
+			}
+			function start() {
+				if (active || disposed) return;
+				active = true;
+				Promise.resolve(options.resume()).catch(function () {});
+				schedule();
+			}
+			function stop() {
+				if (!active) return;
+				active = false;
+				clearSchedule();
+				Promise.resolve(options.suspend()).catch(function () {});
+			}
+			function update(value) {
+				var next = value || {};
+				if (next.enabled && next.playing && next.visible) start();
+				else stop();
+			}
+			function dispose() {
+				if (disposed) return;
+				stop();
+				disposed = true;
+				clearSchedule();
+				Promise.resolve(options.close()).catch(function () {});
+			}
+			return { update: update, dispose: dispose };
+		}
 		/** 展开宽度。 */
 		var WIDTH = 280;
 		/** 本地存储键。 */
@@ -737,31 +785,45 @@ window.__ModuleLoader__.load({
 		 * 但无声」。因此本实现【只在上下文确认 running 之后才路由】；在此之前 audio
 		 * 保持原生直连扬声器，任何情况下都不会因为分析器而静音。路由后若上下文被
 		 * 挂起，则在采样与用户交互时持续尝试恢复。
-		 * @returns {function|null} 采样函数（返回 {bass,energy,vocal} 或 null）
+		 * @returns {object|null} 可暂停分析支路的控制器
 		 */
 		function attachAudioAnalyzer(audio) {
 			try {
 				if (typeof window === "undefined" || !window.AudioContext || !audio) return null;
 				var ctx = new (window.AudioContext || window.webkitAudioContext)();
 				var routed = false; // 是否已把 audio 重路由进 Web Audio 图
+				var analysisWanted = false;
+				var analysisConnected = false;
+				var src = null;
 				var analyser = null;
 				var buf = new Uint8Array(0);
 				var resumePending = false;
+				var connectAnalysis = function () {
+					if (!routed || !src || !analyser || analysisConnected || !analysisWanted) return;
+					try { src.connect(analyser); analysisConnected = true; } catch { /* 保持声音直通 */ }
+				};
+				var disconnectAnalysis = function () {
+					if (!src || !analyser || !analysisConnected) return;
+					try { src.disconnect(analyser); } catch { /* ignore */ }
+					analysisConnected = false;
+				};
 				var routeNow = function () {
 					if (routed) return;
 					try {
-						var src = ctx.createMediaElementSource(audio);
+						src = ctx.createMediaElementSource(audio);
 						analyser = ctx.createAnalyser();
 						analyser.fftSize = 256;
-						src.connect(analyser);
-						analyser.connect(ctx.destination); // 保持音频输出（重路由后必须连回 destination）
+						src.connect(ctx.destination); // 声音始终直通；分析支路可独立断开
 						buf = new Uint8Array(analyser.frequencyBinCount);
 						routed = true;
+						connectAnalysis();
 					} catch {
 						/* 路由失败（如重复路由）：保持原生输出 */
 					}
 				};
 				var resumeCtx = function () {
+					analysisWanted = true;
+					if (ctx.state === "running") { routeNow(); connectAnalysis(); return Promise.resolve(); }
 					if (ctx.state !== "suspended" || resumePending) return;
 					resumePending = true;
 					var p = ctx.resume();
@@ -778,11 +840,20 @@ window.__ModuleLoader__.load({
 						resumePending = false;
 					}
 				};
-				document.addEventListener("pointerdown", resumeCtx, true); // 用户交互恢复音频上下文
-				resumeCtx();
-				return function sample() {
+				var pointerResume = function () { if (analysisWanted) resumeCtx(); };
+				document.addEventListener("pointerdown", pointerResume, true); // 用户交互恢复音频上下文
+				return {
+				resume: resumeCtx,
+				suspend: function () { analysisWanted = false; disconnectAnalysis(); },
+				close: function () {
+					analysisWanted = false;
+					disconnectAnalysis();
+					document.removeEventListener("pointerdown", pointerResume, true);
+					try { return ctx.close(); } catch { return undefined; }
+				},
+				sample: function () {
 					if (audio.paused || audio.ended || audio.readyState < 2) return null;
-					resumeCtx(); // 未 running 时持续尝试恢复；恢复成功后才路由
+					if (!analysisWanted || !analysisConnected) return null;
 					if (!routed || !analyser || ctx.state !== "running") return null;
 					analyser.getByteFrequencyData(buf);
 					var n = buf.length;
@@ -797,6 +868,7 @@ window.__ModuleLoader__.load({
 					if (total < 1) return null;
 					var energy = total / (n * 255);
 					return { bass: bassSum / total, energy: energy, vocal: midSum / total };
+				}
 				};
 			} catch {
 				return null;
@@ -1331,12 +1403,13 @@ window.__ModuleLoader__.load({
 				audio.addEventListener("timeupdate", syncProg);
 				audio.addEventListener("durationchange", syncProg);
 				audio.addEventListener("loadedmetadata", function () { syncProg(); reporter.checkpoint(); });
-				audio.addEventListener("play", function () { reporter.setPlaying(true); });
-				audio.addEventListener("pause", function () { reporter.setPlaying(false); });
+				audio.addEventListener("play", function () { reporter.setPlaying(true); syncAnalyzerLifecycle(); });
+				audio.addEventListener("pause", function () { reporter.setPlaying(false); syncAnalyzerLifecycle(); });
 				audio.addEventListener("seeked", function () { reporter.checkpoint(); });
 				audio.addEventListener("ended", function () {
 					// 自然结束：按播放模式处理（单曲循环本地重播；列表循环/随机交给服务端 next）
 					reporter.setPlaying(false);
+					syncAnalyzerLifecycle();
 					var mode = stateRef.current && typeof stateRef.current.playMode === "number" ? stateRef.current.playMode : 0;
 					if (mode === 1) {
 						try { audio.currentTime = 0; var rp = audio.play(); if (rp && typeof rp.catch === "function") rp.catch(function () {}); } catch { /* ignore */ }
@@ -1346,6 +1419,7 @@ window.__ModuleLoader__.load({
 				});
 				audio.addEventListener("error", function () {
 					reporter.setPlaying(false);
+					syncAnalyzerLifecycle();
 				});
 				var unbindBuffering = bindAudioBuffering(audio, setBuffering);
 				audioRef.current = audio;
@@ -1353,8 +1427,8 @@ window.__ModuleLoader__.load({
 				// 开启时（含页面加载后勾选）由 ensureAnalyzer 挂载。
 				if (readAutoMatch(getLocalStorage())) ensureAnalyzer();
 				return function () {
-					if (analyzerTimerRef.current) clearInterval(analyzerTimerRef.current);
-					analyzerTimerRef.current = null;
+					if (analyzerLifecycleRef.current) analyzerLifecycleRef.current.dispose();
+					analyzerLifecycleRef.current = null;
 					analyzerRef.current = null;
 					unbindBuffering();
 					reporter.dispose();
@@ -1397,8 +1471,18 @@ window.__ModuleLoader__.load({
 			var stableCountRef = React.useRef(0);
 			var currentSongRef = React.useRef(null); // 当前分析中的歌曲（切歌时重置）
 			var recentRef = React.useRef([]); // 最近几次采样（取能量最高者当特征，前奏的低能量采样会被主旋律覆盖）
-			var analyzerRef = React.useRef(null); // 已挂载的采样函数（createMediaElementSource 对同一元素只能调一次）
-			var analyzerTimerRef = React.useRef(null);
+			var analyzerRef = React.useRef(null); // 已挂载的分析控制器（createMediaElementSource 对同一元素只能调一次）
+			var analyzerLifecycleRef = React.useRef(null);
+			var syncAnalyzerLifecycle = function () {
+				var audio = audioRef.current;
+				var lifecycle = analyzerLifecycleRef.current;
+				if (!lifecycle) return;
+				lifecycle.update({
+					enabled: Boolean(autoMatchRef.current),
+					playing: Boolean(audio && !audio.paused && !audio.ended),
+					visible: typeof document === "undefined" || !document.hidden
+				});
+			};
 			// 惰性挂载音频分析器并启动采样定时器。行为：识别到稳定风格后
 			// 识别到稳定风格后【直接切换】宠物并开口说明（不询问——开启自动匹配即代表授权）。
 			// 即时性：不跳过前奏——音频数据就绪即采样（800ms 间隔），连续 2 次
@@ -1408,11 +1492,16 @@ window.__ModuleLoader__.load({
 				var audio = audioRef.current;
 				if (!audio || analyzerRef.current) return;
 				if (typeof window === "undefined" || !window.AudioContext) return;
-				var sampleAudio = attachAudioAnalyzer(audio);
-				if (!sampleAudio) return;
-				analyzerRef.current = sampleAudio;
-				analyzerTimerRef.current = setInterval(function () {
-					if (!autoMatchRef.current) return;
+				var analyzer = attachAudioAnalyzer(audio);
+				if (!analyzer) return;
+				analyzerRef.current = analyzer;
+				analyzerLifecycleRef.current = createAnalyzerLifecycle({
+					intervalMs: 800,
+					resume: analyzer.resume,
+					suspend: analyzer.suspend,
+					close: analyzer.close,
+					sample: analyzer.sample,
+					onSample: function (feat) {
 					var song = stateRef.current && stateRef.current.playing ? stateRef.current.playing.song : null;
 					if (!song || !audio.src) return;
 					// 切歌时重置候选与推荐，避免旧歌特征误匹配新歌
@@ -1423,8 +1512,6 @@ window.__ModuleLoader__.load({
 						recentRef.current = [];
 												return;
 					}
-					var feat = sampleAudio();
-					if (!feat) return;
 					recentRef.current.push(feat);
 					if (recentRef.current.length > 3) recentRef.current.shift();
 					// 取能量最高的采样作为当前特征（前奏铺垫能量低，会被主旋律覆盖）
@@ -1441,13 +1528,21 @@ window.__ModuleLoader__.load({
 						stableCountRef.current = 0;
 						applyPetSwitch(target); // 直接切换，不询问（用户已授权自动匹配）
 					}
-				}, 800);
+					}
+				});
+				syncAnalyzerLifecycle();
 			};
 			// 自动匹配开关变化：开启时确保分析器挂载（修复「勾选后不生效」——
 			// 分析器不再只在页面加载时按初始状态挂载）；关闭时清掉当前推荐
 			React.useEffect(function () {
 				if (autoMatch) ensureAnalyzer();
+				syncAnalyzerLifecycle();
 			}, [autoMatch]);
+			React.useEffect(function () {
+				var onVisibility = function () { syncAnalyzerLifecycle(); };
+				document.addEventListener("visibilitychange", onVisibility);
+				return function () { document.removeEventListener("visibilitychange", onVisibility); };
+			}, []);
 
 			var seekEndTimerRef = React.useRef(null);
 			var seekToRef = React.useRef(null); // 系统媒体键 seek 回调（避免闭包过期）
@@ -2376,6 +2471,7 @@ window.__ModuleLoader__.load({
 		exports.compactStateSignature = compactStateSignature;
 		exports.shouldReloadCollection = shouldReloadCollection;
 		exports.createPlaybackReporter = createPlaybackReporter;
+		exports.createAnalyzerLifecycle = createAnalyzerLifecycle;
 		exports.parseLrc = parseLrc;
 		exports.karaokeProgress = karaokeProgress;
 		exports.syncMediaSession = syncMediaSession;

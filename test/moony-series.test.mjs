@@ -184,6 +184,50 @@ test('playback reporter sends on transitions and checkpoints only while active',
 	assert.equal(timers.size, 0);
 });
 
+test('audio analyzer lifecycle samples only when enabled playing and visible', async () => {
+	const { createAnalyzerLifecycle } = loadClient();
+	let nextTimer = 0;
+	const timers = new Map();
+	const events = [];
+	const lifecycle = createAnalyzerLifecycle({
+		sample: () => ({ energy: 0.5 }),
+		onSample: (value) => events.push(['sample', value.energy]),
+		resume: async () => { events.push(['resume']); },
+		suspend: async () => { events.push(['suspend']); },
+		close: async () => { events.push(['close']); },
+		intervalMs: 800,
+		setTimer(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
+		clearTimer(id) { timers.delete(id); }
+	});
+	lifecycle.update({ enabled: true, playing: true, visible: true });
+	await Promise.resolve();
+	assert.deepEqual(events, [['resume']]);
+	assert.equal(timers.size, 1);
+	assert.equal([...timers.values()][0].delay, 800);
+	lifecycle.update({ enabled: true, playing: true, visible: true });
+	assert.equal(timers.size, 1, 'repeated active updates keep one sampler');
+
+	const [timerId, timer] = [...timers.entries()][0];
+	timers.delete(timerId);
+	timer.fn();
+	assert.deepEqual(events.at(-1), ['sample', 0.5]);
+	assert.equal(timers.size, 1);
+	lifecycle.update({ enabled: true, playing: false, visible: true });
+	await Promise.resolve();
+	assert.equal(timers.size, 0);
+	assert.deepEqual(events.at(-1), ['suspend']);
+	lifecycle.update({ enabled: true, playing: true, visible: false });
+	assert.equal(timers.size, 0);
+	lifecycle.update({ enabled: true, playing: true, visible: true });
+	await Promise.resolve();
+	assert.deepEqual(events.at(-1), ['resume']);
+	assert.equal(timers.size, 1);
+	lifecycle.dispose();
+	await Promise.resolve();
+	assert.equal(timers.size, 0);
+	assert.deepEqual(events.at(-1), ['close']);
+});
+
 test('moon phase clamps progress and fades only through the final eight percent', () => {
 	const { resolveMoonPhase } = loadClient();
 	assert.deepEqual(Object.values(resolveMoonPhase(-1)), [0, 1]);
