@@ -446,6 +446,84 @@ test('refreshing the active song URL updates the server playback source and reje
 	await assert.rejects(() => actions.songUrl({ id: 2, refreshCurrent: true }), /当前歌曲已切换/);
 });
 
+test('favorite playback falls back to an exact metadata source when the official URL is unavailable', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{
+		id: 2083989384,
+		name: '大梦 (Live)',
+		ar: [{ name: '瓦依那' }, { name: '任素汐' }],
+		al: { name: '乐队的夏天3 第7期' },
+		dt: 475367
+	}]);
+	player.toggleFavorite();
+	const matched = [];
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{ songUrl: async () => null }, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async (song) => { matched.push(song); return 'https://audio.test/exact-live.mp3'; } }
+	);
+
+	const result = await actions.queue({ action: 'favorites', favoriteIndex: 0 });
+	assert.equal(result.ok, true);
+	assert.equal(player.state.currentUrl, 'https://audio.test/exact-live.mp3');
+	assert.equal(matched.length, 1);
+	assert.equal(matched[0].id, 2083989384);
+	assert.equal(matched[0].dt, 475367);
+});
+
+test('active-song recovery uses the same exact metadata fallback as initial playback', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{
+		id: 76881,
+		name: '关于小熊',
+		ar: [{ name: '蛋堡' }],
+		al: { name: '收敛水' },
+		dt: 246000,
+		resolvedUrl: 'https://audio.test/expired.mp3'
+	}]);
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{ songUrl: async () => null }, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async () => 'https://audio.test/exact-bear.mp3' }
+	);
+
+	const refreshed = await actions.songUrl({ id: 76881, refreshCurrent: true });
+	assert.equal(refreshed.ok, true);
+	assert.equal(refreshed.url, 'https://audio.test/exact-bear.mp3');
+	assert.equal(player.state.currentUrl, refreshed.url);
+});
+
+test('cross-source fallback is rejected when exact song metadata is incomplete', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 9, name: '同名歌曲', ar: [{ name: '歌手' }], dt: 0 }]);
+	let fallbackCalls = 0;
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{ songUrl: async () => null }, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async () => { fallbackCalls += 1; return 'https://audio.test/unverified.mp3'; } }
+	);
+
+	const refreshed = await actions.songUrl({ id: 9, refreshCurrent: true });
+	assert.equal(refreshed.ok, false);
+	assert.equal(refreshed.url, null);
+	assert.equal(fallbackCalls, 0);
+});
+
+test('official playback URLs remain preferred over cross-source fallback', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }], dt: 269000 }]);
+	let fallbackCalls = 0;
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{ songUrl: async () => 'https://audio.test/official.mp3' }, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async () => { fallbackCalls += 1; return 'https://audio.test/fallback.mp3'; } }
+	);
+
+	const refreshed = await actions.songUrl({ id: 1, refreshCurrent: true });
+	assert.equal(refreshed.url, 'https://audio.test/official.mp3');
+	assert.equal(fallbackCalls, 0);
+});
+
 test('a URL refresh that finishes after a song change cannot overwrite the new song', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([

@@ -32,6 +32,7 @@ import { createClient } from './lib/alger.js';
 import { createPlayer } from './lib/player.js';
 import { createHabits } from './lib/habits.js';
 import { startApiServer, stopApiServer } from './lib/api-server.js';
+import { matchSourceUrl } from './lib/source-match.js';
 import { normalizeTrack } from './lib/recommendation/identity.js';
 import { createTasteProfile } from './lib/recommendation/profile.js';
 import { createLocalLibrary } from './lib/recommendation/local-library.js';
@@ -161,6 +162,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 	const preference = recommendation.preference ?? null;
 	const pool = recommendation.pool ?? null;
 	const scheduler = recommendation.scheduler ?? null;
+	const exactSourceMatch = recommendation.matchSourceUrl ?? matchSourceUrl;
 	const now = typeof recommendation.now === 'function' ? recommendation.now : Date.now;
 	let radioSequence = 0;
 	const refreshSignals = new Set(['favorite', 'unfavorite', 'search-play']);
@@ -211,10 +213,10 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		return { name: s, artist: '' };
 	}
 
-	/** 取歌曲直链：只接受主音乐 API 已确认歌曲身份的官方直链。
-	 * 第三方关键词跨源匹配暂时熔断，避免把翻唱、伴奏或个人上传冒充原唱。 */
-	async function urlFor(song, keyword) {
-		if (song?.resolvedUrl) return { url: song.resolvedUrl };
+	/** 取歌曲直链：官方直链优先；仅在歌名、歌手、时长元数据齐全时，
+	 * 才把完整歌曲元数据交给跨源匹配，避免宽松关键词命中翻唱或个人上传。 */
+	async function urlFor(song, keyword, options = {}) {
+		if (song?.resolvedUrl && !options.skipResolved) return { url: song.resolvedUrl };
 		const kw = String(keyword || '').trim();
 		const parts = splitKeyword(kw);
 		// 关键词歌手与歌曲歌手是否一致（如「周杰伦 晴天」vs 列表里的 A-LNK 版 → 不一致）
@@ -233,6 +235,18 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				if (url) return { url };
 			} catch {
 				/* 继续兜底 */
+			}
+		}
+		const exactArtists = (Array.isArray(artistValues) ? artistValues : [artistValues])
+			.map((a) => typeof a === 'string' ? a : a && a.name)
+			.filter(Boolean);
+		const exactDuration = Number(song?.dt ?? song?.durationMs ?? song?.duration) || 0;
+		if (song?.name && exactArtists.length > 0 && exactDuration > 0 && consistent) {
+			try {
+				const url = await exactSourceMatch(song);
+				if (url) return { url };
+			} catch {
+				/* 严格元数据匹配失败时保持不可播放，不使用宽松关键词兜底。 */
 			}
 		}
 		return null;
@@ -536,7 +550,11 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const id = Number(args?.id);
 			if (!Number.isFinite(id)) throw new Error('请提供有效的歌曲 id。');
 			if (args?.refreshCurrent && Number(player.current()?.id) !== id) throw new Error('当前歌曲已切换，请重试。');
-			const url = await client.songUrl(id, 'higher');
+			const currentSong = args?.refreshCurrent ? player.current() : null;
+			const hit = currentSong
+				? await urlFor(currentSong, null, { skipResolved: true })
+				: { url: await client.songUrl(id, 'higher') };
+			const url = hit?.url || null;
 			if (args?.refreshCurrent && Number(player.current()?.id) !== id) throw new Error('当前歌曲已切换，请重试。');
 			if (args?.refreshCurrent) player.updatePlayback({ currentUrl: url || null, playing: Boolean(url) });
 			return { ok: args?.refreshCurrent ? Boolean(url) : true, id, url: url || null, ...(!url ? { error: '当前歌曲音源不可用。' } : {}) };
