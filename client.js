@@ -93,7 +93,7 @@ window.__ModuleLoader__.load({
 			var recommendation = state.recommendation || {};
 			var radio = recommendation.radio || {};
 			return JSON.stringify([
-				state.ok, state.musicApiUp, state.stateRevision,
+				state.ok, state.musicApiUp, state.instanceId, state.stateRevision,
 				song.id, song.name, playing.isPlaying,
 				playback.position, playback.duration, playback.playing,
 				state.favorite, state.favoriteCount, state.playMode, state.volume,
@@ -105,8 +105,87 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
+		function collectionVersion(instanceId, revision) {
+			if (revision === undefined || revision === null) return null;
+			return String(instanceId || "legacy") + ":" + String(revision);
+		}
+
+		function collectionItemsForVersion(view, expectedVersion) {
+			if (!view || collectionVersion(view.instanceId, view.revision) !== expectedVersion) return null;
+			return Array.isArray(view.items) ? view.items : [];
+		}
+
 		function shouldReloadCollection(cachedRevision, remoteRevision, open) {
 			return Boolean(open) && remoteRevision !== undefined && remoteRevision !== null && cachedRevision !== remoteRevision;
+		}
+
+		function createAudioRecoveryController(options) {
+			var config = options || {};
+			var setTimer = config.setTimer || setTimeout;
+			var clearTimer = config.clearTimer || clearTimeout;
+			var timeoutMs = Math.max(1000, Number(config.timeoutMs) || 7000);
+			var songId = null;
+			var retried = false;
+			var pending = false;
+			var timer = null;
+			var disposed = false;
+			var generation = 0;
+			var clear = function () {
+				if (timer !== null) clearTimer(timer);
+				timer = null;
+			};
+			var playable = function () {
+				var media = typeof config.inspect === "function" ? config.inspect() : null;
+				var duration = Number(media && media.duration);
+				var readyState = Number(media && media.readyState);
+				return Number.isFinite(duration) && duration > 0 && readyState >= 1;
+			};
+			var fail = function (reason) {
+				clear();
+				if (disposed || songId === null || pending) return Promise.resolve(false);
+				var attemptGeneration = generation;
+				var attemptSongId = songId;
+				var context = {
+					songId: attemptSongId,
+					reason: reason || "media-error",
+					isCurrent: function () { return !disposed && generation === attemptGeneration && songId === attemptSongId; }
+				};
+				if (retried) {
+					if (typeof config.fail === "function") config.fail(context);
+					return Promise.resolve(false);
+				}
+				retried = true;
+				pending = true;
+				return Promise.resolve(typeof config.refresh === "function" ? config.refresh(context) : false)
+					.catch(function (error) {
+						if (context.isCurrent() && typeof config.fail === "function") config.fail(Object.assign({}, context, { error: error }));
+						return false;
+					})
+					.finally(function () { if (context.isCurrent()) pending = false; });
+			};
+			var arm = function () {
+				clear();
+				if (disposed || songId === null) return;
+				timer = setTimer(function () {
+					timer = null;
+					if (!playable()) fail("metadata-timeout");
+				}, timeoutMs);
+			};
+			return {
+				begin: function (nextSongId) {
+					var next = nextSongId === undefined || nextSongId === null ? null : String(nextSongId);
+					if (next === songId) return;
+					clear();
+					generation += 1;
+					songId = next;
+					retried = false;
+					pending = false;
+				},
+				arm: arm,
+				loaded: function () { if (playable()) clear(); else arm(); },
+				failed: fail,
+				dispose: function () { disposed = true; clear(); }
+			};
 		}
 
 		function virtualWindow(total, scrollTop, rowHeight, viewportHeight, overscan, threshold) {
@@ -571,15 +650,16 @@ window.__ModuleLoader__.load({
 
 		function QueueListPanel(props) {
 			var items = Array.isArray(props && props.items) ? props.items : [];
+			var loading = Boolean(props && props.loading);
 			return h("div", null, [
-				VirtualizedRows({
+				items.length > 0 || loading ? VirtualizedRows({
 					items: items,
 					className: "dsa-queue-list",
 					rowHeight: 28,
 					viewportHeight: 130,
 					overscan: 5,
 					threshold: 50,
-					empty: h("div", { className: "dsa-empty" }, props && props.loading ? "正在加载播放列表…" : "播放列表为空"),
+					empty: loading ? h("div", { className: "dsa-empty" }, "正在加载播放列表…") : null,
 					renderRow: function (item, index) {
 						return QueueSongRow({
 							key: item.id + "-" + index, item: item, index: index,
@@ -588,14 +668,14 @@ window.__ModuleLoader__.load({
 							onRemove: props.onRemove
 						});
 					}
-				}),
-				h("div", { className: "dsa-qclear-row" }, [
+				}) : null,
+				items.length > 0 ? h("div", { className: "dsa-qclear-row" }, [
 					h("button", {
 						className: "dsa-qclear",
-						disabled: Boolean(props && props.busy) || items.length === 0,
+						disabled: Boolean(props && props.busy),
 						onClick: props && props.onClear
 					}, "清空播放列表")
-				])
+				]) : null
 			]);
 		}
 
@@ -1103,7 +1183,7 @@ window.__ModuleLoader__.load({
 			".dsa-meta{flex:1;min-width:0}",
 			".dsa-title{font-size:13px;font-weight:600;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 1px 4px rgba(0,0,0,0.4)}",
 			".dsa-artist{font-size:11px;line-height:15px;color:rgba(255,255,255,0.75);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-			".dsa-actions{flex:none;display:flex;align-items:center;gap:2px}",
+			".dsa-actions{flex:none;display:flex;align-items:center;gap:6px}",
 			".dsa-btn{flex:none;width:26px;height:26px;border:none;border-radius:8px;background:transparent;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:13px;padding:0;text-shadow:0 1px 3px rgba(0,0,0,0.35)}",
 			".dsa-btn:hover{background:rgba(255,255,255,0.16)}",
 			".dsa-btn:disabled{opacity:0.35;cursor:not-allowed}",
@@ -1421,6 +1501,7 @@ window.__ModuleLoader__.load({
 			var [favoriteSongs, setFavoriteSongs] = React.useState(null);
 			var [favoriteRevision, setFavoriteRevision] = React.useState(null);
 			var [favoritesLoading, setFavoritesLoading] = React.useState(false);
+			var favoritesLoadRef = React.useRef(0);
 			// 关闭/激活与侧边栏开关按钮共享（pub/sub）
 			var [hidden, setHidden] = React.useState(petVis.hidden);
 			React.useEffect(function () { return onPetHidden(setHidden); }, []);
@@ -1544,8 +1625,8 @@ window.__ModuleLoader__.load({
 
 			// 播放列表仅在面板打开且 revision 过期时加载完整行数据。
 			React.useEffect(function () {
-				var remoteRevision = state && state.queue ? state.queue.revision : null;
-				var cachedRevision = queueView ? queueView.revision : null;
+				var remoteRevision = collectionVersion(state && state.instanceId, state && state.queue ? state.queue.revision : null);
+				var cachedRevision = collectionVersion(queueView && queueView.instanceId, queueView ? queueView.revision : null);
 				if (!shouldReloadCollection(cachedRevision, remoteRevision, queueOpen)) return;
 				var cancelled = false;
 				getQueueView().then(function (view) {
@@ -1554,13 +1635,14 @@ window.__ModuleLoader__.load({
 					if (!cancelled) flash("err", (error && error.message) || "读取播放列表失败");
 				});
 				return function () { cancelled = true; };
-			}, [queueOpen, state && state.queue && state.queue.revision, queueView && queueView.revision]);
+			}, [queueOpen, state && state.instanceId, state && state.queue && state.queue.revision, queueView && queueView.instanceId, queueView && queueView.revision]);
 
 			// ---------- 内置 <audio> 播放引擎 ----------
 			// 服务端状态机是唯一事实来源：轮询发现 currentUrl 变化就切换播放；
 			// 音频事件（进度/结束/播放状态）定时上报回服务端。
 			var audioRef = React.useRef(null);
 			var playbackReporterRef = React.useRef(null);
+			var audioRecoveryRef = React.useRef(null);
 			var lastUrlRef = React.useRef(null); // 已加载的直链，避免重复播放
 			var lastSongIdRef = React.useRef(null); // 已识别的歌曲（听歌记忆重播检测）
 			var saidSongRef = React.useRef(null); // 已开口说过的歌曲（每首只说一次）
@@ -1586,13 +1668,40 @@ window.__ModuleLoader__.load({
 					send: reportPlayback
 				});
 				playbackReporterRef.current = reporter;
+				var recovery;
+				recovery = createAudioRecoveryController({
+					timeoutMs: 7000,
+					inspect: function () { return { duration: audio.duration, readyState: audio.readyState }; },
+					refresh: function (context) {
+						return post("/dsh-alger/url", { id: context.songId, refreshCurrent: true }).then(function (result) {
+							if (!context.isCurrent()) return false;
+							if (!result || result.ok === false || !result.url) throw new Error((result && result.error) || "音源刷新失败");
+							lastUrlRef.current = result.url;
+							audio.src = result.url;
+							audio.load();
+							var playResult = audio.play();
+							if (playResult && typeof playResult.catch === "function") playResult.catch(function () {});
+							recovery.arm();
+							return true;
+						});
+					},
+					fail: function (context) {
+						if (!context.isCurrent()) return;
+						try { audio.pause(); } catch { /* ignore */ }
+						reporter.setPlaying(false);
+						reportPlayback({ songId: context.songId, position: audio.currentTime || 0, duration: audio.duration || 0, playing: false, ready: false, failed: true }).catch(function () {});
+						setProg({ pos: audio.currentTime || 0, dur: 0 });
+						flash("err", "当前歌曲音源加载失败，请切换下一首");
+					}
+				});
+				audioRecoveryRef.current = recovery;
 				var syncProg = function () {
 					if (seekingRef.current) return;
 					setProg({ pos: audio.currentTime || 0, dur: audio.duration || 0 });
 				};
 				audio.addEventListener("timeupdate", syncProg);
 				audio.addEventListener("durationchange", syncProg);
-				audio.addEventListener("loadedmetadata", function () { syncProg(); reporter.checkpoint(); });
+				audio.addEventListener("loadedmetadata", function () { recovery.loaded(); syncProg(); reporter.checkpoint(); });
 				audio.addEventListener("play", function () { reporter.setPlaying(true); syncAnalyzerLifecycle(); });
 				audio.addEventListener("pause", function () { reporter.setPlaying(false); syncAnalyzerLifecycle(); });
 				audio.addEventListener("seeked", function () { reporter.checkpoint(); });
@@ -1608,7 +1717,7 @@ window.__ModuleLoader__.load({
 					if (advancePlaybackRef.current) advancePlaybackRef.current();
 				});
 				audio.addEventListener("error", function () {
-					reporter.setPlaying(false);
+					recovery.failed("media-error");
 					syncAnalyzerLifecycle();
 				});
 				var unbindBuffering = bindAudioBuffering(audio, setBuffering);
@@ -1622,6 +1731,8 @@ window.__ModuleLoader__.load({
 					analyzerRef.current = null;
 					unbindBuffering();
 					reporter.dispose();
+					recovery.dispose();
+					if (audioRecoveryRef.current === recovery) audioRecoveryRef.current = null;
 					if (playbackReporterRef.current === reporter) playbackReporterRef.current = null;
 					try { audio.pause(); audio.src = ""; } catch { /* ignore */ }
 					if (audio.parentNode) audio.parentNode.removeChild(audio);
@@ -1758,6 +1869,8 @@ window.__ModuleLoader__.load({
 				if (!audio) return;
 				var st = state || {};
 				var url = st.currentUrl || null;
+				var activeSongId = st.playing && st.playing.song ? st.playing.song.id : null;
+				if (audioRecoveryRef.current) audioRecoveryRef.current.begin(activeSongId);
 				// 无当前曲（清空播放列表等）：停止并释放
 				if (!url) {
 					if (lastUrlRef.current) lastUrlRef.current = null;
@@ -1771,6 +1884,7 @@ window.__ModuleLoader__.load({
 					audio.volume = typeof st.volume === "number" ? st.volume : 0.8;
 					var p = audio.play();
 					if (p && typeof p.catch === "function") p.catch(function () { /* 浏览器阻止自动播放时静默 */ });
+					if (audioRecoveryRef.current) audioRecoveryRef.current.arm();
 				} else if (typeof st.volume === "number" && Math.abs(audio.volume - st.volume) > 0.01) {
 					audio.volume = st.volume;
 				}
@@ -1918,7 +2032,6 @@ window.__ModuleLoader__.load({
 				cancelRadioAdvance();
 				var requestId = "recommend-" + Date.now() + "-" + (recommendRequestRef.current + 1);
 				recommendRequestRef.current = requestId;
-				setFavoritesOpen(false);
 				setQueueOpen(true);
 				setResults(null);
 				setSearched(false);
@@ -1936,28 +2049,35 @@ window.__ModuleLoader__.load({
 				});
 			};
 
-			var loadFavorites = function () {
+			var loadFavorites = function (expectedVersion) {
+				var loadId = favoritesLoadRef.current + 1;
+				favoritesLoadRef.current = loadId;
+				if (expectedVersion && favoriteRevision !== expectedVersion) setFavoriteSongs(null);
 				setFavoritesLoading(true);
 				return favoritesApi().then(function (r) {
+					if (favoritesLoadRef.current !== loadId) return r;
 					setFavoritesLoading(false);
 					if (!r || r.ok === false) throw new Error((r && r.error) || "读取收藏失败");
+					var responseVersion = collectionVersion(r.instanceId, r.revision);
+					if (expectedVersion && responseVersion !== expectedVersion) return r;
 					setFavoriteSongs(r.songs || []);
-					setFavoriteRevision(r.revision === undefined ? null : r.revision);
+					setFavoriteRevision(responseVersion);
 					return r;
 				}).catch(function (error) {
-					setFavoritesLoading(false);
+					if (favoritesLoadRef.current === loadId) setFavoritesLoading(false);
 					throw error;
 				});
 			};
 			React.useEffect(function () {
-				var remoteRevision = state && state.favorites ? state.favorites.revision : null;
+				var remoteRevision = collectionVersion(state && state.instanceId, state && state.favorites ? state.favorites.revision : null);
 				if (!shouldReloadCollection(favoriteRevision, remoteRevision, favoritesOpen)) return;
-				loadFavorites().catch(function (error) { flash("err", error.message || "读取收藏失败"); });
-			}, [favoritesOpen, favoriteRevision, state && state.favorites && state.favorites.revision]);
+				var loadId = favoritesLoadRef.current + 1;
+				loadFavorites(remoteRevision).catch(function (error) { flash("err", error.message || "读取收藏失败"); });
+				return function () { if (favoritesLoadRef.current === loadId) favoritesLoadRef.current += 1; };
+			}, [favoritesOpen, favoriteRevision, state && state.instanceId, state && state.favorites && state.favorites.revision]);
 			var toggleFavorites = function () {
 				if (favoritesOpen) { setFavoritesOpen(false); return; }
 				setFavoritesOpen(true);
-				setQueueOpen(false);
 				setResults(null);
 				setSearched(false);
 				setSearchFeedback(null);
@@ -1980,7 +2100,7 @@ window.__ModuleLoader__.load({
 				removeFavoriteApi(song.id).then(function (r) {
 					if (!r || r.ok === false) throw new Error((r && r.error) || "取消收藏失败");
 					setFavoriteSongs(r.songs || []);
-					setFavoriteRevision(r.revision === undefined ? null : r.revision);
+					setFavoriteRevision(collectionVersion(r.instanceId, r.revision));
 					setTimeout(refresh, 120);
 				}).catch(function (error) {
 					setFavoriteSongs(previous);
@@ -2157,6 +2277,10 @@ window.__ModuleLoader__.load({
 			// 播放信息：state.playing = {ok, isPlaying, song:{...}}
 			var remote = state && state.playing ? state.playing : null;
 			var playing = remote && remote.song ? remote.song : null;
+			var remoteQueueVersion = collectionVersion(state && state.instanceId, state && state.queue ? state.queue.revision : null);
+			var currentQueueItems = collectionItemsForVersion(queueView, remoteQueueVersion);
+			var remoteFavoriteVersion = collectionVersion(state && state.instanceId, state && state.favorites ? state.favorites.revision : null);
+			var currentFavoriteSongs = favoriteRevision === remoteFavoriteVersion ? favoriteSongs : null;
 			var isPlaying = Boolean(remote && remote.isPlaying);
 			var albumArtwork = playing && playing.albumPic ? playing.albumPic : null;
 			var dot = readyDot(state);
@@ -2574,8 +2698,8 @@ window.__ModuleLoader__.load({
 							: null,
 						h(SearchFeedbackPanel, { message: searchFeedback }),
 						favoritesOpen ? h(FavoriteListPanel, {
-							songs: favoriteSongs || [],
-							loading: favoritesLoading,
+							songs: currentFavoriteSongs || [],
+							loading: favoritesLoading || currentFavoriteSongs === null,
 							busy: busy,
 							onPlayAll: function () { playFavoritesFrom(0); },
 							onPlayFrom: playFavoritesFrom,
@@ -2583,7 +2707,7 @@ window.__ModuleLoader__.load({
 							onClose: function () { setFavoritesOpen(false); }
 						}) : null,
 						// 播放列表
-						!favoritesOpen && state && state.queue
+						state && state.queue
 							? h("div", { className: "dsa-queue" }, [
 									h("div", { className: "dsa-queue-title", onClick: function () { setQueueOpen(!queueOpen); } }, [
 									h("span", null, state.recommendation && state.recommendation.radio && state.recommendation.radio.waitingForNextBatch ? "正在准备下一批…" : "播放列表"),
@@ -2592,8 +2716,8 @@ window.__ModuleLoader__.load({
 									]),
 									queueOpen
 									? h(QueueListPanel, {
-										items: queueView && Array.isArray(queueView.items) ? queueView.items : [],
-										loading: !(queueView && Array.isArray(queueView.items)),
+									items: currentQueueItems || [],
+									loading: currentQueueItems === null,
 										currentIndex: state.queue.index,
 										busy: busy,
 										onJump: onQueueJump,
@@ -2665,7 +2789,10 @@ window.__ModuleLoader__.load({
 		exports.createStatePoller = createStatePoller;
 		exports.fetchJsonWithTimeout = fetchJsonWithTimeout;
 		exports.compactStateSignature = compactStateSignature;
+		exports.collectionVersion = collectionVersion;
+		exports.collectionItemsForVersion = collectionItemsForVersion;
 		exports.shouldReloadCollection = shouldReloadCollection;
+		exports.createAudioRecoveryController = createAudioRecoveryController;
 		exports.virtualWindow = virtualWindow;
 		exports.createPlaybackReporter = createPlaybackReporter;
 		exports.createAnalyzerLifecycle = createAnalyzerLifecycle;

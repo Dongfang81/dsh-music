@@ -346,6 +346,29 @@ test('active playback records habits before checking night while paused reports 
 	assert.deepEqual(events, ['record']);
 });
 
+test('a terminal browser audio failure stops the server from advertising fake playback', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	const recorded = [];
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000 },
+		{}, {}, player, {}, { recordPlayback: async (value) => { recorded.push(value); } }
+	);
+	await actions.playback({ songId: 1, position: 0, duration: 0, playing: false, ready: false, failed: true });
+	assert.equal(player.state.playing, false);
+	assert.equal(player.state.ready, false);
+	player.playSong({ id: 2, name: '夜曲', ar: [{ name: '周杰伦' }] });
+	player.state.position = 12;
+	player.state.duration = 200;
+	player.state.ready = true;
+	const recordedBeforeStale = recorded.length;
+	const stale = await actions.playback({ songId: 1, position: 0, duration: 0, playing: false, ready: false, failed: true });
+	assert.equal(stale.stale, true);
+	assert.equal(player.state.playing, true, 'a late failure report from the previous song must not pause the new song');
+	assert.deepEqual({ position: player.state.position, duration: player.state.duration, ready: player.state.ready }, { position: 12, duration: 200, ready: true });
+	assert.equal(recorded.length, recordedBeforeStale, 'stale values are not recorded against the new song');
+});
+
 test('strong preference signals schedule refresh while skip and completion only update history', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([
@@ -391,7 +414,7 @@ test('favorites route lists songs and removes one favorite without touching play
 });
 
 test('favorite list responses carry the revision that invalidates an open panel', async () => {
-	const player = createPlayer({ file: null });
+	const player = createPlayer({ file: null, instanceId: 'boot-a' });
 	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
 	player.toggleFavorite();
 	const actions = plugin.buildActionsForTest(
@@ -399,10 +422,48 @@ test('favorite list responses carry the revision that invalidates an open panel'
 		{ musicApiUp: async () => true }, {}, player, {}, { recordPlayback: async () => {} }
 	);
 	const listed = await actions.favoritesList();
+	assert.equal(listed.instanceId, 'boot-a');
 	assert.equal(listed.revision, player.revisions().favoritesRevision);
 	const removed = await actions.favoritesRemove({ songId: 1 });
 	assert.equal(removed.revision, player.revisions().favoritesRevision);
 	assert.ok(removed.revision > listed.revision);
+});
+
+test('refreshing the active song URL updates the server playback source and rejects stale songs', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] }]);
+	const calls = [];
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000 },
+		{ songUrl: async (id, level) => { calls.push([id, level]); return 'https://audio.test/fresh.mp3'; } },
+		{}, player, {}, { recordPlayback: async () => {} }
+	);
+	const refreshed = await actions.songUrl({ id: 1, refreshCurrent: true });
+	assert.equal(refreshed.url, 'https://audio.test/fresh.mp3');
+	assert.equal(player.state.currentUrl, refreshed.url);
+	assert.equal(player.state.playing, true);
+	assert.deepEqual(calls, [[1, 'higher']]);
+	await assert.rejects(() => actions.songUrl({ id: 2, refreshCurrent: true }), /当前歌曲已切换/);
+});
+
+test('a URL refresh that finishes after a song change cannot overwrite the new song', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([
+		{ id: 1, name: '晴天', ar: [{ name: '周杰伦' }] },
+		{ id: 2, name: '夜曲', ar: [{ name: '周杰伦' }] }
+	]);
+	let resolveUrl;
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000 },
+		{ songUrl: () => new Promise((resolve) => { resolveUrl = resolve; }) },
+		{}, player, {}, { recordPlayback: async () => {} }
+	);
+	const pending = actions.songUrl({ id: 1, refreshCurrent: true });
+	player.jump(1);
+	resolveUrl('https://audio.test/stale.mp3');
+	await assert.rejects(() => pending, /当前歌曲已切换/);
+	assert.equal(player.current().id, 2);
+	assert.notEqual(player.state.currentUrl, 'https://audio.test/stale.mp3');
 });
 
 test('favorite removal action updates only favorites and schedules preference refresh', async () => {
@@ -543,10 +604,10 @@ test('long-term preference writes require an explicit valid value', async () => 
 	});
 });
 
-test('client recommendation opens the queue, closes competing panels, and keeps a stable label', async () => {
+test('client recommendation opens the queue, preserves favorites, and keeps a stable label', async () => {
 	const source = await readFile(join(root, 'client.js'), 'utf8');
-	const handler = source.slice(source.indexOf('var onRecommend = function () {'), source.indexOf('var loadFavorites = function () {'));
-	assert.match(handler, /setFavoritesOpen\(false\)/);
+	const handler = source.slice(source.indexOf('var onRecommend = function () {'), source.indexOf('var loadFavorites = function'));
+	assert.doesNotMatch(handler, /setFavoritesOpen\(false\)/);
 	assert.match(handler, /setQueueOpen\(true\)/);
 	assert.match(handler, /setResults\(null\)/);
 	assert.match(handler, /setSearched\(false\)/);

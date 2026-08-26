@@ -277,6 +277,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			return {
 				ok: true,
 				musicApiUp,
+				instanceId: snap.instanceId,
 				stateRevision: snap.stateRevision,
 				playing: snap.playing
 					? { ok: true, isPlaying: snap.isPlaying, song: snap.playing }
@@ -457,7 +458,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		/** 浏览器收藏面板：只暴露一个扁平收藏列表，不承担目录或整理功能。 */
 		async favoritesList() {
 			const songs = player.state.favorites.map(compactSong);
-			return { ok: true, revision: player.revisions().favoritesRevision, count: songs.length, songs };
+			return { ok: true, instanceId: player.instanceId, revision: player.revisions().favoritesRevision, count: songs.length, songs };
 		},
 
 		/** 从扁平收藏列表取消一首收藏，不影响当前播放上下文。 */
@@ -467,7 +468,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			const result = player.removeFavorite(songId);
 			if (result.removed) await feedback('unfavorite', result.removed);
 			const songs = player.state.favorites.map(compactSong);
-			return { ok: true, revision: player.revisions().favoritesRevision, removedId: result.removed ? Number(result.removed.id) : null, count: songs.length, songs };
+			return { ok: true, instanceId: player.instanceId, revision: player.revisions().favoritesRevision, removedId: result.removed ? Number(result.removed.id) : null, count: songs.length, songs };
 		},
 
 		/** alger_song */
@@ -534,13 +535,18 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		async songUrl(args) {
 			const id = Number(args?.id);
 			if (!Number.isFinite(id)) throw new Error('请提供有效的歌曲 id。');
+			if (args?.refreshCurrent && Number(player.current()?.id) !== id) throw new Error('当前歌曲已切换，请重试。');
 			const url = await client.songUrl(id, 'higher');
-			return { ok: true, id, url: url || null };
+			if (args?.refreshCurrent && Number(player.current()?.id) !== id) throw new Error('当前歌曲已切换，请重试。');
+			if (args?.refreshCurrent) player.updatePlayback({ currentUrl: url || null, playing: Boolean(url) });
+			return { ok: args?.refreshCurrent ? Boolean(url) : true, id, url: url || null, ...(!url ? { error: '当前歌曲音源不可用。' } : {}) };
 		},
 
 		/** 播放进度上报（浮动窗口 <audio> 定时上报） */
 		async playback(args) {
 			const value = asRecord(args);
+			if (value.failed === true && Number(value.songId) !== Number(player.current()?.id)) return { ok: true, stale: true };
+			if (value.failed === true) player.updatePlayback({ playing: false });
 			const activePlayback = Boolean(value.playing) && Boolean(player.state.playing);
 			player.reportPlayback({
 				position: Number(value.position) || 0,

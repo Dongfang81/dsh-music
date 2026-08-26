@@ -127,8 +127,9 @@ test('state fetch timeout aborts a hung request so polling can recover', async (
 });
 
 test('compact state signatures ignore object identity and collection reloads require an open stale panel', () => {
-	const { compactStateSignature, shouldReloadCollection } = loadClient();
+	const { collectionItemsForVersion, collectionVersion, compactStateSignature, shouldReloadCollection } = loadClient();
 	const first = {
+		instanceId: 'boot-a',
 		stateRevision: 3,
 		musicApiUp: true,
 		playing: { song: { id: 1, name: '晴天' }, isPlaying: true },
@@ -138,10 +139,84 @@ test('compact state signatures ignore object identity and collection reloads req
 	};
 	assert.equal(compactStateSignature(first), compactStateSignature(JSON.parse(JSON.stringify(first))));
 	assert.notEqual(compactStateSignature(first), compactStateSignature({ ...first, queue: { ...first.queue, revision: 9 } }));
-	assert.equal(shouldReloadCollection(null, 4, true), true);
-	assert.equal(shouldReloadCollection(4, 4, true), false);
-	assert.equal(shouldReloadCollection(4, 5, false), false);
-	assert.equal(shouldReloadCollection(4, 5, true), true);
+	assert.notEqual(compactStateSignature(first), compactStateSignature({ ...first, instanceId: 'boot-b' }));
+	assert.equal(collectionVersion('boot-a', 4), 'boot-a:4');
+	assert.equal(shouldReloadCollection(null, 'boot-a:4', true), true);
+	assert.equal(shouldReloadCollection('boot-a:4', 'boot-a:4', true), false);
+	assert.equal(shouldReloadCollection('boot-a:4', 'boot-b:4', false), false);
+	assert.equal(shouldReloadCollection('boot-a:4', 'boot-b:4', true), true);
+	assert.deepEqual(collectionItemsForVersion({ instanceId: 'boot-a', revision: 4, items: [{ id: 1 }] }, 'boot-a:4'), [{ id: 1 }]);
+	assert.equal(collectionItemsForVersion({ instanceId: 'boot-a', revision: 4, items: [{ id: 1 }] }, 'boot-b:4'), null);
+});
+
+test('audio recovery refreshes one broken source then stops fake playback after a second failure', async () => {
+	const { createAudioRecoveryController } = loadClient();
+	const refreshed = [];
+	const failed = [];
+	const timers = new Map();
+	let nextTimer = 0;
+	let playable = false;
+	const recovery = createAudioRecoveryController({
+		refresh(context) { refreshed.push(context); return Promise.resolve({ ok: true }); },
+		fail(context) { failed.push(context); },
+		inspect() { return { duration: playable ? 180 : 0, readyState: playable ? 2 : 0 }; },
+		timeoutMs: 7000,
+		setTimer(fn, delay) {
+			const id = ++nextTimer;
+			timers.set(id, { fn() { timers.delete(id); fn(); }, delay });
+			return id;
+		},
+		clearTimer(id) { timers.delete(id); }
+	});
+	recovery.begin('song-1');
+	recovery.arm();
+	assert.equal([...timers.values()][0].delay, 7000);
+	[...timers.values()][0].fn();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(refreshed.length, 1);
+	assert.equal(failed.length, 0);
+	recovery.arm();
+	[...timers.values()][0].fn();
+	await Promise.resolve();
+	assert.equal(refreshed.length, 1, 'the same song URL is refreshed at most once');
+	assert.equal(failed.length, 1, 'a second failure exits the fake playing state');
+
+	recovery.begin('song-2');
+	playable = true;
+	recovery.arm();
+	[...timers.values()][0].fn();
+	await Promise.resolve();
+	assert.equal(refreshed.length, 1, 'loaded metadata does not trigger recovery');
+	assert.equal(failed.length, 1);
+
+	playable = false;
+	recovery.begin('song-3');
+	recovery.loaded();
+	assert.equal(timers.size, 1, 'zero-duration metadata keeps the watchdog armed');
+	playable = true;
+	recovery.loaded();
+	assert.equal(timers.size, 0, 'usable metadata disarms the watchdog');
+});
+
+test('audio recovery ignores a late failure from a song that is no longer current', async () => {
+	const { createAudioRecoveryController } = loadClient();
+	let rejectRefresh;
+	let firstContext;
+	const failed = [];
+	const recovery = createAudioRecoveryController({
+		refresh(context) {
+			firstContext = context;
+			return new Promise((_resolve, reject) => { rejectRefresh = reject; });
+		},
+		fail(context) { failed.push(context); }
+	});
+	recovery.begin('song-a');
+	const pending = recovery.failed('media-error');
+	recovery.begin('song-b');
+	assert.equal(firstContext.isCurrent(), false);
+	rejectRefresh(new Error('late failure'));
+	await pending;
+	assert.equal(failed.length, 0);
 });
 
 test('virtual window renders every short row but bounds long collection work', () => {
@@ -406,6 +481,15 @@ test('queue list preserves original indices while virtualizing long queues', () 
 	assert.equal(rows.length, 10, '130px queue viewport mounts only its initial overscanned rows');
 	assert.equal(rows[0].props.children[0].props.children, '1.');
 	assert.equal(findNodes(tree, (node) => node.props?.className === 'dsa-virtual-space')[0].props.style.height, 120 * 28);
+});
+
+test('an empty queue relies on its zero count and only shows content while loading', () => {
+	const { QueueListPanel } = loadClient();
+	const empty = QueueListPanel({ items: [], loading: false });
+	assert.equal(findNodes(empty, (node) => node.props?.className === 'dsa-empty').length, 0);
+	assert.equal(findNodes(empty, (node) => node.props?.className === 'dsa-qclear-row').length, 0);
+	const loading = QueueListPanel({ items: [], loading: true });
+	assert.equal(findNodes(loading, (node) => node.props?.className === 'dsa-empty')[0].props.children, '正在加载播放列表…');
 });
 
 test('search rows add by their catalog song id', () => {
@@ -710,6 +794,24 @@ test('recommendation remains actionable while the background pool is preparing',
 	assert.ok(findNodes(harness.tree(), (node) => node.props?.className === 'dsa-queue').length, 'the queue opens immediately while preparation continues');
 });
 
+test('favorites and queue stay independently visible in the expanded player', () => {
+	const harness = loadMusicPlayerHarness({
+		playerStateOverride: {
+			queue: { count: 2, index: 0, revision: 1 },
+			favorites: { count: 1, revision: 1 },
+			favoriteCount: 1
+		}
+	});
+	findNodes(harness.tree(), (node) => node.type === harness.client.MoonyPet)[0].props.onClick({ stopPropagation() {} });
+	const queueTitle = findNodes(harness.tree(), (node) => node.props?.className === 'dsa-queue-title')[0];
+	queueTitle.props.onClick();
+	const favoritesButton = findNodes(harness.tree(), (node) => node.type === 'button' && node.props?.children === '收藏')[0];
+	favoritesButton.props.onClick();
+	assert.equal(findNodes(harness.tree(), (node) => node.type === harness.client.FavoriteListPanel).length, 1);
+	assert.equal(findNodes(harness.tree(), (node) => node.props?.className === 'dsa-queue').length, 1);
+	assert.equal(findNodes(harness.tree(), (node) => node.type === harness.client.QueueListPanel).length, 1);
+});
+
 test('audio completion retries a waiting radio boundary and exposes a lightweight queue hint', () => {
 	const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
 	const endedHandler = source.slice(source.indexOf('audio.addEventListener("ended"'), source.indexOf('audio.addEventListener("error"'));
@@ -738,6 +840,7 @@ test('expanded player uses the accepted wider readable layout', () => {
 	assert.equal(PLAYER_WIDTH, 304);
 	assert.match(PLAYER_CSS, /\.dsa-qitem\{[^}]*font-size:11\.5px/);
 	assert.match(PLAYER_CSS, /\.dsa-favorite-row \.s\{[^}]*font-size:10px/);
+	assert.match(PLAYER_CSS, /\.dsa-actions\{[^}]*gap:6px/);
 });
 
 test('MusicPlayer preserves the selected Moony through the collapsed and expanded player flows', () => {

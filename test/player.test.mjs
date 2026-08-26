@@ -339,7 +339,7 @@ test('player revisions change only for material state and collection mutations',
 });
 
 test('compact snapshots omit collection rows while queueView provides revisioned rows', () => {
-	const player = createPlayer({ file: null });
+	const player = createPlayer({ file: null, instanceId: 'boot-a' });
 	player.replaceAndPlay([song(1, '一'), song(2, '二')]);
 	player.toggleFavorite();
 
@@ -348,6 +348,7 @@ test('compact snapshots omit collection rows while queueView provides revisioned
 	assert.deepEqual(legacy.favoriteIds, [1]);
 
 	const compact = player.snapshot({ includeQueue: false, includeFavoriteIds: false });
+	assert.equal(compact.instanceId, 'boot-a');
 	assert.deepEqual(compact.queue, {
 		count: 2,
 		index: 0,
@@ -360,6 +361,7 @@ test('compact snapshots omit collection rows while queueView provides revisioned
 	assert.equal('favoriteIds' in compact, false);
 	assert.equal(compact.stateRevision, player.revisions().stateRevision);
 	assert.deepEqual(player.queueView(), {
+		instanceId: 'boot-a',
 		revision: player.revisions().queueRevision,
 		count: 2,
 		index: 0,
@@ -368,4 +370,13 @@ test('compact snapshots omit collection rows while queueView provides revisioned
 			{ id: 2, name: '二', artists: '歌手2' }
 		]
 	});
+});
+
+test('each player boot identifies collection snapshots independently from numeric revisions', () => {
+	const first = createPlayer({ file: null, instanceId: 'boot-a' });
+	const restarted = createPlayer({ file: null, instanceId: 'boot-b' });
+	assert.deepEqual(first.revisions(), restarted.revisions());
+	assert.notEqual(first.snapshot().instanceId, restarted.snapshot().instanceId);
+	assert.equal(first.queueView().instanceId, 'boot-a');
+	assert.equal(restarted.queueView().instanceId, 'boot-b');
 });
