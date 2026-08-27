@@ -163,6 +163,9 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 	const pool = recommendation.pool ?? null;
 	const scheduler = recommendation.scheduler ?? null;
 	const exactSourceMatch = recommendation.matchSourceUrl ?? matchSourceUrl;
+	const sourceMatchTimeoutMs = recommendation.sourceMatchTimeoutMs === undefined
+		? Math.min(8000, Math.max(1000, Number(cfg.timeoutMs) || 8000))
+		: Math.max(1, Number(recommendation.sourceMatchTimeoutMs) || 1);
 	const now = typeof recommendation.now === 'function' ? recommendation.now : Date.now;
 	let radioSequence = 0;
 	const refreshSignals = new Set(['favorite', 'unfavorite', 'search-play']);
@@ -180,6 +183,21 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		noticeStore.until = Date.now() + ms;
 	};
 	shared.getNotice = () => (noticeStore.until > Date.now() ? noticeStore.text : null);
+
+	async function exactSourceWithinDeadline(song) {
+		let timer = null;
+		try {
+			return await Promise.race([
+				Promise.resolve(exactSourceMatch(song)),
+				new Promise((resolve) => {
+					timer = setTimeout(() => resolve(null), sourceMatchTimeoutMs);
+					timer.unref?.();
+				})
+			]);
+		} finally {
+			if (timer !== null) clearTimeout(timer);
+		}
+	}
 
 	// 音乐服务是否在线：成功长缓存、失败短缓存；并发状态读取共享一次探活。
 	let apiUpCache = { value: false, at: 0, valid: false };
@@ -243,7 +261,7 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 		const exactDuration = Number(song?.dt ?? song?.durationMs ?? song?.duration) || 0;
 		if (song?.name && exactArtists.length > 0 && exactDuration > 0 && consistent) {
 			try {
-				const url = await exactSourceMatch(song);
+				const url = await exactSourceWithinDeadline(song);
 				if (url) return { url };
 			} catch {
 				/* 严格元数据匹配失败时保持不可播放，不使用宽松关键词兜底。 */
@@ -712,7 +730,17 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				}
 				log(`收藏列表 ${fv.count} 首，从「${fv.song.name}」开始播放`);
 				const hit = await urlFor(fv.song);
-				player.updatePlayback({ currentUrl: hit ? hit.url : null, playing: true });
+				if (!hit) {
+					player.updatePlayback({ currentUrl: null, playing: false });
+					return {
+						ok: false,
+						steps: [...steps, `「${fv.song.name}」暂无可用播放地址`],
+						guidance: '已停止播放，可换一首收藏歌曲再试。',
+						mode: 'favorites',
+						queueLength: player.state.queue.length
+					};
+				}
+				player.updatePlayback({ currentUrl: hit.url, playing: true });
 				return { ok: true, steps, mode: 'favorites', added: fv.count, queueLength: player.state.queue.length, playedName: fv.song.name };
 			}
 
@@ -769,7 +797,10 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				if (idx >= player.state.queue.length) throw new Error(`队列下标越界: ${idx}（队列共 ${player.state.queue.length} 首）`);
 				const song = player.jump(idx);
 				const hit = await urlFor(song);
-				if (!hit) return { ok: false, steps: [...steps, `「${song.name}」暂无可用播放地址`], guidance: '换一首试试。' };
+				if (!hit) {
+					player.updatePlayback({ currentUrl: null, playing: false });
+					return { ok: false, steps: [...steps, `「${song.name}」暂无可用播放地址`], guidance: '换一首试试。' };
+				}
 				player.updatePlayback({ currentUrl: hit.url, playing: true });
 				return { ok: true, steps, mode: 'jump', playedName: song ? song.name : '', queueLength: player.state.queue.length };
 			} else {
@@ -787,7 +818,19 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 			if (mode === 'replace') {
 				const song = player.replaceAndPlay(songs);
 				const hit = await urlFor(song);
-				player.updatePlayback({ currentUrl: hit ? hit.url : null, playing: true });
+				if (!hit) {
+					player.updatePlayback({ currentUrl: null, playing: false });
+					return {
+						ok: false,
+						steps: [...steps, `「${song?.name || ''}」暂无可用播放地址`],
+						guidance: '歌单已载入，但第一首暂时无法播放。',
+						mode,
+						added: songs.length,
+						queueLength: player.state.queue.length,
+						playedName: null
+					};
+				}
+				player.updatePlayback({ currentUrl: hit.url, playing: true });
 				shared.setNotice('♫ 整单播放：' + (song ? song.name : '') + '（' + songs.length + ' 首）');
 				return { ok: true, steps, mode, added: songs.length, queueLength: player.state.queue.length, playedName: song ? song.name : null };
 			}
@@ -810,8 +853,23 @@ function buildActions(cfg, client, shared, player, apiHandle, habits, recommenda
 				);
 			if (action === 'toggle-play' || action === 'play' || action === 'pause') {
 				const wantPlay = action === 'play' ? true : action === 'pause' ? false : !player.state.playing;
-				if (player.state.playing === wantPlay) {
+				if (player.state.playing === wantPlay && (!wantPlay || player.state.currentUrl)) {
 					return { action, message: `当前已是${wantPlay ? '播放' : '暂停'}状态，无需操作` };
+				}
+				if (wantPlay && !player.state.currentUrl) {
+					const song = player.current();
+					if (!song) return { ok: false, action, message: '播放列表为空，无法播放。', playing: false };
+					const songId = Number(song.id);
+					const hit = await urlFor(song, null, { skipResolved: true });
+					if (Number(player.current()?.id) !== songId) {
+						return { ok: false, action, message: '当前歌曲已切换，请重试。', playing: player.state.playing };
+					}
+					if (!hit) {
+						player.updatePlayback({ currentUrl: null, playing: false });
+						return { ok: false, action, message: `「${song.name}」暂无可用播放地址。`, playing: false };
+					}
+					player.updatePlayback({ currentUrl: hit.url, playing: true });
+					return { ok: true, action, message: '已播放', playing: true };
 				}
 				player.updatePlayback({ playing: wantPlay });
 				return { action, message: wantPlay ? '已播放' : '已暂停', playing: player.state.playing };

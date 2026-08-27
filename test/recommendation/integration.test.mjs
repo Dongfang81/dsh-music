@@ -471,6 +471,76 @@ test('favorite playback falls back to an exact metadata source when the official
 	assert.equal(matched[0].dt, 475367);
 });
 
+test('favorite playback returns within the cross-source deadline', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '受限歌曲', ar: [{ name: '歌手' }], dt: 240000 }]);
+	player.toggleFavorite();
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{ songUrl: async () => null }, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async () => new Promise(() => {}), sourceMatchTimeoutMs: 10 }
+	);
+
+	const result = await Promise.race([
+		actions.queue({ action: 'favorites', favoriteIndex: 0 }),
+		new Promise((_, reject) => setTimeout(() => reject(new Error('favorite playback stayed pending')), 100))
+	]);
+	assert.equal(result.ok, false);
+});
+
+test('favorite playback failure does not leave a fake playing state', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '受限歌曲', ar: [{ name: '歌手' }], dt: 240000 }]);
+	player.toggleFavorite();
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{ songUrl: async () => null }, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async () => null }
+	);
+
+	const result = await actions.queue({ action: 'favorites', favoriteIndex: 0 });
+	assert.equal(result.ok, false);
+	assert.equal(player.state.playing, false);
+	assert.equal(player.state.currentUrl, null);
+});
+
+test('queue jump failure does not leave the newly selected song pretending to play', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([
+		{ id: 1, name: '可播歌曲', ar: [{ name: '歌手' }], dt: 200000, resolvedUrl: 'https://audio.test/one.mp3' },
+		{ id: 2, name: '受限歌曲', ar: [{ name: '歌手' }], dt: 240000 }
+	]);
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{ songUrl: async () => null }, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async () => null }
+	);
+
+	const result = await actions.queue({ action: 'jump', index: 1 });
+	assert.equal(result.ok, false);
+	assert.equal(player.current().id, 2);
+	assert.equal(player.state.playing, false);
+	assert.equal(player.state.currentUrl, null);
+});
+
+test('playlist replacement failure does not leave its first song pretending to play', async () => {
+	const player = createPlayer({ file: null });
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{
+			songUrl: async () => null,
+			playlist: async () => ({ name: '受限歌单', tracks: [{ id: 3, name: '受限歌曲', ar: [{ name: '歌手' }], dt: 240000 }] })
+		}, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async () => null }
+	);
+
+	const result = await actions.queue({ action: 'playlist', playlistId: 88 });
+	assert.equal(result.ok, false);
+	assert.equal(player.current().id, 3);
+	assert.equal(player.state.playing, false);
+	assert.equal(player.state.currentUrl, null);
+});
+
 test('active-song recovery uses the same exact metadata fallback as initial playback', async () => {
 	const player = createPlayer({ file: null });
 	player.replaceAndPlay([{
@@ -491,6 +561,37 @@ test('active-song recovery uses the same exact metadata fallback as initial play
 	assert.equal(refreshed.ok, true);
 	assert.equal(refreshed.url, 'https://audio.test/exact-bear.mp3');
 	assert.equal(player.state.currentUrl, refreshed.url);
+});
+
+test('play command repairs a fake playing state by resolving a fresh source', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '本末', ar: [{ name: '任素汐' }], dt: 202048 }]);
+	player.updatePlayback({ currentUrl: null, playing: true });
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{ songUrl: async () => 'https://audio.test/fresh-after-restart.mp3' }, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async () => null }
+	);
+
+	const result = await actions.control({ action: 'play' });
+	assert.equal(result.playing, true);
+	assert.equal(player.state.currentUrl, 'https://audio.test/fresh-after-restart.mp3');
+});
+
+test('play after restart stays stopped when no source can be resolved', async () => {
+	const player = createPlayer({ file: null });
+	player.replaceAndPlay([{ id: 1, name: '受限歌曲', ar: [{ name: '歌手' }], dt: 240000 }]);
+	player.updatePlayback({ currentUrl: null, playing: false });
+	const actions = plugin.buildActionsForTest(
+		{ musicApiPort: 30588, musicApiHost: '127.0.0.1', timeoutMs: 1000, recommendationLearning: false },
+		{ songUrl: async () => null }, {}, player, {}, { recordPlayback: async () => {} },
+		{ matchSourceUrl: async () => null }
+	);
+
+	const result = await actions.control({ action: 'play' });
+	assert.equal(result.ok, false);
+	assert.equal(player.state.playing, false);
+	assert.equal(player.state.currentUrl, null);
 });
 
 test('cross-source fallback is rejected when exact song metadata is incomplete', async () => {
